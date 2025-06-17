@@ -63,8 +63,7 @@ if ret:
         }
     }
 
-    # 정확한 경로로 저장 (pytorch_mpiigaze_demo/ptgaze/data/calib)
-    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..","ptgaze", "data", "calib"))
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__)))
     os.makedirs(base_dir, exist_ok=True)
     save_path = os.path.join(base_dir, "camera_params.yaml")
 
