@@ -1,6 +1,7 @@
 from djitellopy import Tello
 from threading import *
 import cv2, time
+import numpy as np
 
 class TelloController(Tello):
     __frame_read = None
@@ -62,7 +63,7 @@ class TelloController(Tello):
                 if self.__camera_direction == Tello.CAMERA_FORWARD:
                     self.__frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 elif self.__camera_direction == Tello.CAMERA_DOWNWARD:
-                    self.__frame = frame
+                    self.__frame = frame[0:np.shape(frame)[0]//3, :, 0]
             else:
                 continue
 
