@@ -3,11 +3,11 @@ import time
 
 tello = TelloController()
 def main():
-    tello.start(motor_on=True)
-    tello.setUpVideo(show_video=True, camera_direction=TelloController.CAMERA_FORWARD)
-    tello.set_video_bitrate(tello.BITRATE_1M)
+    tello.start(motor_on=False)
+    tello.set_video_bitrate(tello.BITRATE_2MBPS)
     tello.set_video_fps(tello.FPS_30)
     tello.set_video_resolution(tello.RESOLUTION_480P)
+    tello.setUpVideo(show_video=True, camera_direction=TelloController.CAMERA_FORWARD)
     tello.printInfo()
     while not tello.can_read_frame():
         time.sleep(0.1)
@@ -15,6 +15,8 @@ def main():
     tello.set_speed(100)
     if not tello.can_flight():
         return
+    # while True:
+    #     time.sleep(0.1)
     tello.takeoff()
     time.sleep(1.2)
     height = tello.get_height()
@@ -30,7 +32,7 @@ def main():
     tello.go_xyz_speed(100, 0, 150 - height, 100)
 
     while True:
-        pass
+        time.sleep(0.1)
 
 if __name__ == '__main__':
     try:
