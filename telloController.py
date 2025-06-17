@@ -63,12 +63,12 @@ class TelloController(Tello):
                 if self.__camera_direction == Tello.CAMERA_FORWARD:
                     self.__frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 elif self.__camera_direction == Tello.CAMERA_DOWNWARD:
-                    self.__frame = frame[0:np.shape(frame)[0]//3, :, 0]
+                    self.__frame = frame[0:np.shape(frame)[0]//3, :, :]
             else:
                 continue
 
             if self.__frame_callback is not None:
-                self.__frame_callback(frame)
+                self.__frame_callback(self.__frame)
 
             if self.__show_video:
                 cv2.imshow("DroneCamera", self.__frame)
