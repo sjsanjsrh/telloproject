@@ -39,6 +39,9 @@ if __name__ == '__main__':
         main()
     except KeyboardInterrupt:
         print("프로그램 종료")
+    except Exception as e:
+        print(f"오류 발생: {e}")
+        tello.land()
     finally:
         try:
             tello.land()

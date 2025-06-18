@@ -6,10 +6,17 @@
     "configurations": [
 
         {
-            "name": "Python 디버거: 현재 파일",
+            "name": "Python 디버거: main.py",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/main.py",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Python 디버거: main_cam_test.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/main_cam_test.py",
             "console": "integratedTerminal"
         }
     ]

@@ -12,6 +12,7 @@ class TelloController(Tello):
     __camera_direction = None
 
     thread_readFrame:Thread = None
+    __lock = Lock()
 
     __frame_callback = None
 
@@ -58,20 +59,36 @@ class TelloController(Tello):
     def __readFrame(self):
         # self.__frame = self.__frame_read.frame
         while True:
-            frame = self.__frame_read.frame
-            if frame is not None:
-                if self.__camera_direction == Tello.CAMERA_FORWARD:
-                    self.__frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                elif self.__camera_direction == Tello.CAMERA_DOWNWARD:
-                    self.__frame = frame[0:np.shape(frame)[0]//3, :, :]
-            else:
+            frame = self.__frame_read.get_queued_frame()
+            if frame is None:
+                time.sleep(0.001)
                 continue
+            else:
+                if self.__camera_direction == Tello.CAMERA_FORWARD:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                elif self.__camera_direction == Tello.CAMERA_DOWNWARD:
+                    frame = frame[0:np.shape(frame)[0]//3, :, :]
+
+            with self.__lock:
+                self.__frame = frame
 
             if self.__frame_callback is not None:
                 self.__frame_callback(self.__frame)
 
             if self.__show_video:
-                cv2.imshow("DroneCamera", self.__frame)
+                if not hasattr(self, 'priv_frame_timestamp'):
+                    self.priv_frame_timestamp = time.time()
+                dt = time.time() - self.priv_frame_timestamp
+                self.priv_frame_timestamp = time.time()
+                out_frame = self.__frame.copy()
+                # FPS 계산
+                if dt > 0:
+                    fps = 1 / dt
+                    cv2.putText(out_frame, f"FPS: {fps:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                else:
+                    fps = 0
+                    cv2.putText(out_frame, "FPS: N/A", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)   
+                cv2.imshow("DroneCamera", out_frame)
                 cv2.waitKey(1)
 
     def __setupVideo(self, show_video=False, camera_direction=Tello.CAMERA_FORWARD):
@@ -83,8 +100,11 @@ class TelloController(Tello):
         self.streamon()
 
         while self.__frame_read == None:
-            self.__frame_read = self.get_frame_read()
-            time.sleep(0.01)
+            try:
+                self.__frame_read = self.get_frame_read(with_queue=True, max_queue_len=1)
+                time.sleep(0.01)
+            except Exception as e:
+                print(f"오류 발생: {e}")
         print("Video stream is ready.")
 
         # Start frame read thread
@@ -106,3 +126,11 @@ class TelloController(Tello):
             self.thread_readFrame.join()
         self.__frame_read = None
         cv2.destroyAllWindows()
+
+    def get_attitude(self):
+        """IMU 각도(pitch, roll, yaw) 반환"""
+        return {
+            'pitch': self.get_pitch(),
+            'roll': self.get_roll(),
+            'yaw': self.get_yaw()
+        }
