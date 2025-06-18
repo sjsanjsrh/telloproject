@@ -4,6 +4,7 @@ import cv2
 import numpy as np
 from camera_calibration.camera_tranceform import CameraTransform
 from pid_controller import DronePIDController
+import math
 
 tello = TelloController()
 cam = CameraTransform("camera_calibration/camera_params.yaml")
@@ -76,11 +77,14 @@ def main():
     #     time.sleep(0.1)
 
     tello.takeoff()
-    time.sleep(1.2)
+    pid = DronePIDController(tello)
+    # pid.move_to(50, 0, 0)
+    # print("드론이 목표 위치로 이동 됨")
+    # while True:
+    #     time.sleep(0.1)
     height = tello.get_height()
     print(f"현재 높이: {height}cm")
     tello.go_xyz_speed(0, 0, 100 - height, 100)
-    pid = DronePIDController(tello)
 
     while True:
         height = tello.get_height()
@@ -88,8 +92,8 @@ def main():
         if target_point is not None:
             u, v = target_point
             attitude = tello.get_attitude()
-            pitch = attitude['pitch']
-            roll = attitude['roll']
+            pitch, roll = attitude['pitch'], attitude['roll']
+            pitch, roll = 0, 0  # 테스트용으로 고정
             X, Y = cam.uv_to_cm(u, v, height, undistort=True, camera_pitch_deg=pitch, camera_roll_deg=roll)
             print(f"실제 좌표: X={X:.2f}cm, Y={Y:.2f}cm (pitch={pitch:.2f}°, roll={roll:.2f}°)")
             X, Y = int(round(X)), int(round(Y))
@@ -97,10 +101,17 @@ def main():
             if dt == 0:
                 time.sleep(0.01)
                 continue
-            pid.control_position(-X, -Y, dt=dt)
+            error = math.sqrt(X**2 + Y**2)/height
+            if error < 0.05:
+                tello.go_xyz_speed(0, 0, -50, 100)
+            else:
+                pid.control_position(X, Y, dt=dt)
+                time.sleep(0.1)
+            print(f"오차: {error:.2f}")
         else:
             print("타겟을 찾을 수 없습니다.")
-            time.sleep(0.1)
+            tello.land()
+            return
 
     tello.takeoff()
     time.sleep(1.2)
