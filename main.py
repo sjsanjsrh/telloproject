@@ -27,11 +27,13 @@ target_point = None
 tracking_mode = "init"  # "ellipse" or "contour"
 
 def ellipse_aspect_ratio(ellipse):
+    """타원의 장축과 단축 비율을 계산합니다."""
     major_axis = max(ellipse[1][0], ellipse[1][1])
     minor_axis = min(ellipse[1][0], ellipse[1][1])
     return major_axis / minor_axis if minor_axis > 0 else 0
 
 def frame_callback(frame):
+    """프레임 콜백 함수, 드론의 카메라 영상 처리 및 타겟 추적을 수행합니다."""
     target = None
 
     white_threshold = WHITE_THRESHOLD
@@ -56,6 +58,10 @@ def frame_callback(frame):
                 contour_area = cv2.contourArea(cnt)
                 ellipse_area = np.pi * (ellipse[1][0]/2) * (ellipse[1][1]/2)
                 area_ratio = contour_area / ellipse_area if ellipse_area > 0 else 0
+                # 타원의 면적 비율과 장축/단축 비율을 기준으로 필터링
+                # 타원의 면적 비율이 ELLIPSIS_AREA_RATIO_RANGE 범위 내에 있고,
+                # 타원의 장축/단축 비율이 ELLIPSIS_ASPECT_RATIO_THRESHOLD 이하이며,
+                # 컨투어 면적이 ELLIPSIS_SIZE_THRESHOLD 이상인 경우에만 타원으로 간주
                 if ELLIPSIS_AREA_RATIO_RANGE[0] < area_ratio < ELLIPSIS_AREA_RATIO_RANGE[1] and \
                         ellipse_aspect_ratio(ellipse) < ELLIPSIS_ASPECT_RATIO_THRESHOLD and \
                         contour_area > ELLIPSIS_SIZE_THRESHOLD:
