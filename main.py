@@ -130,7 +130,7 @@ def main():
 
     height = tello.get_height()
     print(f"현재 높이: {height}cm")
-    tello.go_xyz_speed(155, 0, 0, 100) # waypoint 3
+    tello.go_xyz_speed(155, 0, 0, 100) # waypoint 4
     print("waypoint 4 도달")
 
     # 착륙
