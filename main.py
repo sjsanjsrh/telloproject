@@ -138,12 +138,12 @@ def main():
 
     height = tello.get_height()
     print(f"현재 높이: {height}cm")
-    tello.go_xyz_speed(80, -20, 70, 100) # waypoint 3
+    tello.go_xyz_speed(80, -35, 70, 100) # waypoint 3
     print("waypoint 3 도달")
 
     height = tello.get_height()
     print(f"현재 높이: {height}cm")
-    tello.go_xyz_speed(155, 0, 0, 100) # waypoint 4
+    tello.go_xyz_speed(150, 0, 0, 100) # waypoint 4
     print("waypoint 4 도달")
 
     fly_time = time.time()
