@@ -18,12 +18,12 @@ class DronePIDController:
     YAW_KD = 0.0
     OUTPUT_LIMITS = (-30, 30)
     X_KP = 1.5
-    X_KI = 0.75
-    X_KD = 1.0
+    X_KI = 0.5
+    X_KD = 1.2
 
     Y_KP = 1.5
-    Y_KI = 0.75
-    Y_KD = 1.0
+    Y_KI = 0.5
+    Y_KD = 1.2
 
     Z_KP = 0.5
     Z_KI = 0.1
