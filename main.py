@@ -16,11 +16,11 @@ ELLIPSIS_ASPECT_RATIO_THRESHOLD = 1.35
 ELLIPSIS_SIZE_THRESHOLD = 50
 
 TARGET_ERROR_THRESHOLD = 0.15   # 목표 오차 임계값 (cm)
-TARGET_ERROR_THRESHOLD_CONT = 0.05  # 컨투어 모드에서의 목표 오차 임계값 (cm)
+TARGET_ERROR_THRESHOLD_CONT = 0.025  # 컨투어 모드에서의 목표 오차 임계값 (cm)
 
 COUNTOUR_HEIGHT = 50
 
-HOLD_TIME = 0.4
+HOLD_TIME = 0.6
 
 target_point = None
 
@@ -100,7 +100,7 @@ def main():
     while not tello.can_read_frame():
         time.sleep(0.1)
     print("드론 연결 성공")
-    tello.set_speed(70)
+    tello.set_speed(50)
     if not tello.can_flight():
         return
     
@@ -108,11 +108,16 @@ def main():
     
     tello.takeoff()
     print("이륙 완료")
+    
+    height = tello.get_height()
+    print(f"현재 높이: {height}cm")
+    tello.go_xyz_speed(0, 0, 40, 70)  # hover
+    print("호버링 완료")
     time.sleep(1.2)
 
     height = tello.get_height()
     print(f"현재 높이: {height}cm")
-    tello.go_xyz_speed(80, 15, 80, 100)  # waypoint 1
+    tello.go_xyz_speed(80, 15, 40, 100)  # waypoint 1
     print("waypoint 1 도달")
     time.sleep(0.5)
 
@@ -194,8 +199,7 @@ def main():
     print(f"착륙까지 걸린 시간: {land_time - start_time:.2f}초")
 
 
-    while True:
-        time.sleep(0.1)
+    time.sleep(3.0)
 
 if __name__ == '__main__':
     try:
