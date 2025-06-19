@@ -104,6 +104,8 @@ def main():
     if not tello.can_flight():
         return
     
+    start_time = time.time()
+    
     tello.takeoff()
     print("이륙 완료")
     time.sleep(1.2)
@@ -132,6 +134,9 @@ def main():
     print(f"현재 높이: {height}cm")
     tello.go_xyz_speed(155, 0, 0, 100) # waypoint 4
     print("waypoint 4 도달")
+
+    fly_time = time.time()
+    print(f" 비행 시간: {fly_time - start_time:.2f}초")
 
     # 착륙
     print("착륙진행")
@@ -183,7 +188,11 @@ def main():
         
         time.sleep(0.1)
 
-    print("착륙완료")
+    land_time = time.time()
+    
+    print(f"비행 시간: {fly_time - start_time:.2f}초")
+    print(f"착륙까지 걸린 시간: {land_time - start_time:.2f}초")
+
 
     while True:
         time.sleep(0.1)
