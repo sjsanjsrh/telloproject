@@ -27,13 +27,26 @@ def resolve_cli_path(path_text: str, must_exist: bool = False) -> Path:
     return REPO_ROOT / candidate
 
 
+def resolve_output_path(path_text: str) -> Path:
+    candidate = Path(path_text)
+    if candidate.is_absolute():
+        return candidate
+
+    for base_dir in (CURRENT_DIR, REPO_ROOT):
+        resolved = base_dir / candidate
+        if resolved.parent.exists() or resolved.parent == base_dir:
+            return resolved
+
+    return CURRENT_DIR / candidate
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--data', default='data/data.yaml', help='data yaml path (relative to this folder)')
     p.add_argument('--preprocess', action='store_true', help='Run random 4:3 crop preprocessing before training')
     p.add_argument('--images', default='data/img', help='source images folder for preprocessing')
     p.add_argument('--labels', default='data/labels', help='source labels folder for preprocessing (YOLO txt). If missing, images only')
-    p.add_argument('--out', default='data_cropped', help='output folder for preprocessed data')
+    p.add_argument('--out', default='yolo_seg/res/data_cropped', help='output folder for preprocessed data')
     p.add_argument('--min-scale', type=float, default=0.6, help='min crop scale for preprocessing')
     p.add_argument('--trials', type=int, default=1, help='number of crops per image')
     p.add_argument('--epochs', type=int, default=100)
@@ -94,7 +107,7 @@ def main():
         # assume args.data points to a COCO JSON file
         src_json = resolve_cli_path(args.data, must_exist=True)
         images_path = resolve_cli_path(args.images, must_exist=True)
-        out_path = resolve_cli_path(args.out)
+        out_path = resolve_output_path(args.out)
         print('Running COCO split preprocessing: json=', src_json, ' images=', images_path, ' out=', out_path)
         coco_info = split_coco(str(src_json), str(images_path), str(out_path), split=0.8)
         converted_root = out_path.parent / f'{out_path.name}_yolo'
@@ -118,7 +131,8 @@ def main():
         imgsz=args.imgsz,
         batch=args.batch,
         amp=False,
-        device=args.device
+        device=args.device,
+        project=str(CURRENT_DIR / 'res' / 'runs')
     )
 
 
