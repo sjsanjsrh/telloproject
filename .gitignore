@@ -155,5 +155,6 @@ cython_debug/
 .vscode/
 
 # project specific ignores
-yolo_seg/data/img/*.*
-!yolo_seg/data/img/.placeholder
+yolo_seg/data/*
+!*.placeholder
+yolo_seg/*.pt
