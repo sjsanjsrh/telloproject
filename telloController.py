@@ -13,8 +13,13 @@ class TelloController(Tello):
 
     thread_readFrame:Thread = None
     __lock = Lock()
+    __video_session_id = 0
+    __video_res = None
 
     __frame_callback = None
+    
+    def get_video_res(self):
+        return self.__video_res
 
     def __del__(self):
         super().__del__()
@@ -57,41 +62,46 @@ class TelloController(Tello):
         return True
     
     def __readFrame(self):
-        # self.__frame = self.__frame_read.frame
-        while True:
-            frame = self.__frame_read.get_queued_frame()
-            if frame is None:
-                time.sleep(0.001)
-                continue
-            else:
-                if self.__camera_direction == Tello.CAMERA_FORWARD:
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                elif self.__camera_direction == Tello.CAMERA_DOWNWARD:
-                    frame = frame[0:np.shape(frame)[0]//3, :, :]
-
-            with self.__lock:
-                self.__frame = frame
-
-            if self.__frame_callback is not None:
-                self.__frame_callback(self.__frame)
-
-            if self.__show_video:
-                if not hasattr(self, 'priv_frame_timestamp'):
-                    self.priv_frame_timestamp = time.time()
-                dt = time.time() - self.priv_frame_timestamp
-                self.priv_frame_timestamp = time.time()
-                out_frame = self.__frame.copy()
-                # FPS 계산
-                if dt > 0:
-                    fps = 1 / dt
-                    cv2.putText(out_frame, f"FPS: {fps:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        session_id = self.__video_session_id
+        try:
+            while self.__video_session_id == session_id:
+                frame = self.__frame_read.get_queued_frame()
+                if frame is None:
+                    time.sleep(0.001)
+                    continue
                 else:
-                    fps = 0
-                    cv2.putText(out_frame, "FPS: N/A", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)   
-                cv2.imshow("DroneCamera", out_frame)
-                cv2.waitKey(1)
+                    if self.__camera_direction == Tello.CAMERA_FORWARD:
+                        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    elif self.__camera_direction == Tello.CAMERA_DOWNWARD:
+                        frame = frame[0:self.__video_res, :, :]
+
+                with self.__lock:
+                    self.__frame = frame
+
+                if self.__frame_callback is not None:
+                    self.__frame_callback(self.__frame)
+
+                if self.__show_video:
+                    if not hasattr(self, 'priv_frame_timestamp'):
+                        self.priv_frame_timestamp = time.time()
+                    dt = time.time() - self.priv_frame_timestamp
+                    self.priv_frame_timestamp = time.time()
+                    out_frame = self.__frame.copy()
+                    # FPS 계산
+                    if dt > 0:
+                        fps = 1 / dt
+                        cv2.putText(out_frame, f"FPS: {fps:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    else:
+                        fps = 0
+                        cv2.putText(out_frame, "FPS: N/A", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)   
+                    cv2.imshow("DroneCamera", out_frame)
+                    cv2.waitKey(1)
+        finally:
+            if self.thread_readFrame is current_thread():
+                self.thread_readFrame = None
 
     def __setupVideo(self, show_video=False, camera_direction=Tello.CAMERA_FORWARD):
+        self.__video_session_id += 1
         if self.thread_readFrame is not None and self.thread_readFrame.is_alive():
             self.closseVideo()
         self.__frame_read = None
@@ -114,6 +124,20 @@ class TelloController(Tello):
     def set_video_direction(self, direction):
         self.__camera_direction = direction
         super().set_video_direction(self.__camera_direction)
+        
+    def set_video_resolution(self, resolution):
+        if (resolution == self.RESOLUTION_720P):
+            self.__video_res = 720
+        elif (resolution == self.RESOLUTION_480P):
+            self.__video_res = 480
+        else:
+            raise ValueError("Invalid video resolution")
+        super().set_video_resolution(resolution)
+
+    def switch_video_direction(self, direction):
+        if(direction == self.__camera_direction):
+            return
+        self.set_video_direction(direction)
 
     # __setupVideo thread processing warper
     def setUpVideo(self, show_video = False, camera_direction=Tello.CAMERA_FORWARD, frame_callback=None):
@@ -121,9 +145,12 @@ class TelloController(Tello):
         Thread(target=self.__setupVideo, args=[show_video, camera_direction], daemon=True).start()
 
     def closseVideo(self):
+        self.__video_session_id += 1
         self.streamoff()
-        if self.thread_readFrame is not None and self.thread_readFrame.is_alive():
+        if self.thread_readFrame is not None and self.thread_readFrame.is_alive() and self.thread_readFrame is not current_thread():
             self.thread_readFrame.join()
+        if self.thread_readFrame is not None and not self.thread_readFrame.is_alive():
+            self.thread_readFrame = None
         self.__frame_read = None
         cv2.destroyAllWindows()
 
