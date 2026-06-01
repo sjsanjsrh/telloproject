@@ -70,10 +70,14 @@ class TelloController(Tello):
                     time.sleep(0.001)
                     continue
                 else:
+                    
+                    # print(f"Received frame: {frame.shape}, camera_direction={self.__camera_direction}, video_res={self.__video_res}")
                     if self.__camera_direction == Tello.CAMERA_FORWARD:
+                        frame = frame[0:self.__video_res, :, :]
                         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     elif self.__camera_direction == Tello.CAMERA_DOWNWARD:
-                        frame = frame[0:self.__video_res, :, :]
+                        frame = frame[0:frame.shape[1]*3//4, :, :]
+                        pass
 
                 with self.__lock:
                     self.__frame = frame

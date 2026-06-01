@@ -6,10 +6,11 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from telloController import TelloController
 
 tello = TelloController()
-cam_modis_dw = True
+cam_modis_dw = False  # False: 전면카메라, True: 하단카메라
 
 # 저장할 디렉토리
-save_dir = "./calib_images"
+# save_dir = "./calib_images"
+save_dir = "./yolo_seg/data/img"
 os.makedirs(save_dir, exist_ok=True)
 
 exit_code = False
@@ -51,7 +52,7 @@ def frame_callback(frame):
 
 tello.start(motor_on=False)
 
-tello.set_video_bitrate(tello.BITRATE_2MBPS)
+tello.set_video_bitrate(tello.BITRATE_AUTO)
 tello.set_video_fps(tello.FPS_30)
 tello.set_video_resolution(tello.RESOLUTION_480P)
 if not cam_modis_dw:
