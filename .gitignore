@@ -158,4 +158,4 @@ cython_debug/
 yolo_seg/data/*
 yolo_seg/res/*
 !*.placeholder
-yolo_seg/*.pt
+*.pt

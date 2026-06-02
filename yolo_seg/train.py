@@ -42,7 +42,7 @@ def resolve_output_path(path_text: str) -> Path:
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument('--data', default='data/data.yaml', help='data yaml path (relative to this folder)')
+    p.add_argument('--data', default='yolo_seg/data/result_coco.json', help='data path (COCO JSON or Ultralytics data.yaml)')
     p.add_argument('--preprocess', action='store_true', help='Run random 4:3 crop preprocessing before training')
     p.add_argument('--images', default='data/img', help='source images folder for preprocessing')
     p.add_argument('--labels', default='data/labels', help='source labels folder for preprocessing (YOLO txt). If missing, images only')
@@ -100,12 +100,11 @@ def write_out_yaml(out_dir: Path, base_info: dict):
 def main():
     args = parse_args()
     cwd = REPO_ROOT
-    data_yaml = resolve_cli_path(args.data, must_exist=True)
+    data_source = resolve_cli_path(args.data, must_exist=True)
 
-    # preprocess if requested (COCO pipeline assumed)
-    if args.preprocess:
-        # assume args.data points to a COCO JSON file
-        src_json = resolve_cli_path(args.data, must_exist=True)
+    # preprocess when explicitly requested or when the input is a COCO JSON file
+    if args.preprocess or data_source.suffix.lower() == '.json':
+        src_json = data_source
         images_path = resolve_cli_path(args.images, must_exist=True)
         out_path = resolve_output_path(args.out)
         print('Running COCO split preprocessing: json=', src_json, ' images=', images_path, ' out=', out_path)
@@ -118,8 +117,8 @@ def main():
         out_yaml = write_out_yaml(converted_root, coco_info)
         data_to_use = out_yaml
     else:
-        # assume args.data is a COCO json or data.yaml already configured
-        data_to_use = data_yaml
+        # assume args.data is already a ready-to-use Ultralytics YAML
+        data_to_use = data_source
 
     # 모델 및 데이터 세팅
     model = YOLO("yolo26n-seg.pt")
