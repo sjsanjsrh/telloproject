@@ -34,6 +34,7 @@ class SquarePoseDetection:
 	tvec: Optional[np.ndarray]
 	class_id: Optional[int] = None
 	class_name: Optional[str] = None
+	hole_contours: Optional[list[np.ndarray]] = None
 
 	@property
 	def position_cm(self) -> Optional[tuple[float, float, float]]:
@@ -99,6 +100,37 @@ def contour_to_square_corners(contour: np.ndarray) -> Optional[np.ndarray]:
 	return order_points(box)
 
 
+def contours_from_mask_with_holes(mask: np.ndarray) -> list[tuple[np.ndarray, list[np.ndarray]]]:
+	"""Extract outer contours and their hole contours from a binary mask.
+
+	The hierarchy is preserved so ring-like objects keep inner voids instead of
+	collapsing into a single filled contour.
+	"""
+
+	binary_mask = (np.asarray(mask) > 0).astype(np.uint8)
+	if binary_mask.ndim != 2:
+		raise ValueError("contours_from_mask_with_holes expects a 2D mask")
+
+	contours, hierarchy = cv2.findContours(binary_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+	if not contours or hierarchy is None:
+		return []
+
+	hierarchy = hierarchy[0]
+	components: list[tuple[np.ndarray, list[np.ndarray]]] = []
+
+	for index, contour in enumerate(contours):
+		if hierarchy[index][3] != -1:
+			continue
+		if cv2.contourArea(contour) <= 0:
+			continue
+
+		hole_contours = [contours[hole_index] for hole_index, relation in enumerate(hierarchy) if relation[3] == index and cv2.contourArea(contours[hole_index]) > 0]
+		components.append((contour, hole_contours))
+
+	components.sort(key=lambda item: cv2.contourArea(item[0]), reverse=True)
+	return components
+
+
 class YoloSquarePoseEstimator:
 	"""Estimate the pose of a square from a YOLO segmentation output."""
 
@@ -135,14 +167,44 @@ class YoloSquarePoseEstimator:
 					return False
 		return True
 
-	def _extract_candidate_contours(self, result) -> list[tuple[np.ndarray, float, Optional[int], Optional[str]]]:
+	def _extract_candidate_contours(self, result) -> list[tuple[np.ndarray, list[np.ndarray], float, Optional[int], Optional[str]]]:
 		"""Extract contours from an Ultralytics result or a mask-like object."""
 
-		candidates: list[tuple[np.ndarray, float, Optional[int], Optional[str]]] = []
+		candidates: list[tuple[np.ndarray, list[np.ndarray], float, Optional[int], Optional[str]]] = []
 		names = getattr(result, "names", None)
 
 		masks = getattr(result, "masks", None)
 		boxes = getattr(result, "boxes", None)
+		mask_data = getattr(masks, "data", None) if masks is not None else None
+		if mask_data is not None:
+			if hasattr(mask_data, "detach"):
+				mask_array = mask_data.detach().cpu().numpy()
+			else:
+				mask_array = np.asarray(mask_data)
+
+			if mask_array.ndim == 2:
+				mask_array = mask_array[np.newaxis, ...]
+
+			for index, mask in enumerate(mask_array):
+				components = contours_from_mask_with_holes(mask)
+				if not components:
+					continue
+
+				confidence = 1.0
+				class_id = None
+				class_name = None
+				if boxes is not None and len(boxes) > index:
+					box_conf = boxes.conf[index]
+					confidence = float(box_conf.item() if hasattr(box_conf, "item") else box_conf)
+					class_tensor = boxes.cls[index]
+					class_id = int(class_tensor.item() if hasattr(class_tensor, "item") else class_tensor)
+					if isinstance(names, dict):
+						class_name = names.get(class_id)
+
+				for outer_contour, hole_contours in components:
+					candidates.append((outer_contour, hole_contours, confidence, class_id, class_name))
+			return candidates
+
 		if masks is not None and getattr(masks, "xy", None) is not None:
 			polygons = masks.xy
 			for index, polygon in enumerate(polygons):
@@ -157,38 +219,11 @@ class YoloSquarePoseEstimator:
 					class_id = int(class_tensor.item() if hasattr(class_tensor, "item") else class_tensor)
 					if isinstance(names, dict):
 						class_name = names.get(class_id)
-				candidates.append((contour, confidence, class_id, class_name))
+				candidates.append((contour, [], confidence, class_id, class_name))
 			return candidates
 
-		mask_data = getattr(masks, "data", None) if masks is not None else None
 		if mask_data is None:
 			return candidates
-
-		if hasattr(mask_data, "detach"):
-			mask_array = mask_data.detach().cpu().numpy()
-		else:
-			mask_array = np.asarray(mask_data)
-
-		if mask_array.ndim == 2:
-			mask_array = mask_array[np.newaxis, ...]
-
-		for index, mask in enumerate(mask_array):
-			binary_mask = (mask > 0.5).astype(np.uint8) * 255
-			contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-			if not contours:
-				continue
-			contour = max(contours, key=cv2.contourArea)
-			confidence = 1.0
-			class_id = None
-			class_name = None
-			if boxes is not None and len(boxes) > index:
-				box_conf = boxes.conf[index]
-				confidence = float(box_conf.item() if hasattr(box_conf, "item") else box_conf)
-				class_tensor = boxes.cls[index]
-				class_id = int(class_tensor.item() if hasattr(class_tensor, "item") else class_tensor)
-				if isinstance(names, dict):
-					class_name = names.get(class_id)
-			candidates.append((contour, confidence, class_id, class_name))
 
 		return candidates
 
@@ -231,7 +266,7 @@ class YoloSquarePoseEstimator:
 		names = getattr(result, "names", None)
 		best_detection: Optional[SquarePoseDetection] = None
 
-		for contour, confidence, class_id, class_name in candidates:
+		for contour, hole_contours, confidence, class_id, class_name in candidates:
 			if not self._class_matches(class_id, class_name, names):
 				continue
 
@@ -251,6 +286,7 @@ class YoloSquarePoseEstimator:
 				center_px=center_px,
 				corners_px=corners_px,
 				contour=np.asarray(contour, dtype=np.float32),
+				hole_contours=[np.asarray(hole, dtype=np.float32) for hole in hole_contours] if hole_contours else None,
 				area_px=contour_area,
 				confidence=float(confidence),
 				score=float(score),

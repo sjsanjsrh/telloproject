@@ -7,7 +7,11 @@ from pid_controller import DronePIDController
 import math
 
 tello = TelloController()
-cam = CameraTransform("camera_calibration/camera_params.yaml")
+CAMERA_DIRECTION = TelloController.CAMERA_DOWNWARD
+cam = CameraTransform(
+    "camera_calibration/camera_params.yaml",
+    camera_direction="downward",
+)
 
 WHITE_THRESHOLD = 250
 WHITE_THRESHOLD_CONT = 150
@@ -101,7 +105,7 @@ def main():
     tello.set_video_bitrate(tello.BITRATE_1MBPS)
     tello.set_video_fps(tello.FPS_30)
     tello.set_video_resolution(tello.RESOLUTION_480P)
-    tello.setUpVideo(show_video=True, camera_direction=TelloController.CAMERA_DOWNWARD, frame_callback=frame_callback)
+    tello.setUpVideo(show_video=True, camera_direction=CAMERA_DIRECTION, frame_callback=frame_callback)
     tello.printInfo()
     while not tello.can_read_frame():
         time.sleep(0.1)
