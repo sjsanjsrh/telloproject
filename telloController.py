@@ -21,6 +21,12 @@ class TelloController(Tello):
     def get_video_res(self):
         return self.__video_res
 
+    def get_frame(self):
+        with self.__lock:
+            if self.__frame is None:
+                return None
+            return self.__frame.copy()
+
     def __del__(self):
         super().__del__()
         try:
@@ -39,7 +45,14 @@ class TelloController(Tello):
         except:
             pass
 
+    def get_wifi_snr(self):
+        try:
+            return self.send_read_command("wifi?")
+        except Exception as e:
+            return f"unavailable ({e})"
+
     def printInfo(self):
+        print(f"Wi-Fi SNR: {self.get_wifi_snr()}")
         print(f"현재 배터리: {self.get_battery()}%")
         print(f"현재 온도: {self.get_temperature()}")
 
