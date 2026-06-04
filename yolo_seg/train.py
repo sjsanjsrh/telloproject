@@ -53,6 +53,7 @@ def parse_args():
     p.add_argument('--imgsz', type=int, default=416)
     p.add_argument('--batch', type=int, default=4)
     p.add_argument('--device', default='cpu', help='training device, e.g. cpu or cuda:0')
+    p.add_argument('--workers', type=int, default=None, help='number of dataloader worker processes; omit to use Ultralytics default')
     return p.parse_args()
 
 
@@ -99,6 +100,9 @@ def write_out_yaml(out_dir: Path, base_info: dict):
 
 def main():
     args = parse_args()
+    if args.workers is not None and args.workers < 0:
+        raise ValueError('--workers must be 0 or greater')
+
     cwd = REPO_ROOT
     data_source = resolve_cli_path(args.data, must_exist=True)
 
@@ -124,15 +128,19 @@ def main():
     model = YOLO("yolo26n-seg.pt")
 
     # 학습 시작
-    model.train(
+    train_kwargs = dict(
         data=str(data_to_use),
         epochs=args.epochs,
         imgsz=args.imgsz,
         batch=args.batch,
         amp=False,
         device=args.device,
-        project=str(CURRENT_DIR / 'res' / 'runs')
+        project=str(CURRENT_DIR / 'res' / 'runs'),
     )
+    if args.workers is not None:
+        train_kwargs['workers'] = args.workers
+
+    model.train(**train_kwargs)
 
 
 if __name__ == '__main__':
