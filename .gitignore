@@ -159,4 +159,5 @@ yolo_seg/data/*
 yolo_seg/res/*
 !*.placeholder
 *.pt
+calib_images/
 yolo_seg/data_*
