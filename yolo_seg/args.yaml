@@ -19,7 +19,7 @@ rect: false # rectangular training
 cos_lr: false # cosine LR schedule
 close_mosaic: 10 # disable mosaic for last N epochs
 resume: false # resume training
-amp: false # mixed precision
+amp: true # mixed precision
 fraction: 1.0 # dataset fraction
 profile: false # profile speed
 freeze: null # freeze layers
