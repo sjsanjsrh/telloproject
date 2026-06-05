@@ -8,7 +8,7 @@ save_period: -1 # checkpoint period, -1 uses default
 cache: ram # dataset cache mode
 device: '0' # train device
 workers: 8 # dataloader workers
-name: train-9 # run name under project
+name: train # run name under project
 exist_ok: false # overwrite same run name
 pretrained: true # use pretrained weights
 optimizer: auto # optimizer
