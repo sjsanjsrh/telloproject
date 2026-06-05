@@ -69,14 +69,14 @@ degrees: 0.0 # rotation augmentation
 translate: 0.0 # translation augmentation
 scale: 0.0 # scale augmentation
 shear: 0.0 # shear augmentation
-perspective: 0.001 # perspective augmentation
+perspective: 0.0 # perspective augmentation
 flipud: 0.0 # vertical flip probability
 fliplr: 0.5 # horizontal flip probability
 bgr: 0.0 # BGR channel swap probability
-mosaic: 1.0 # mosaic probability
+mosaic: 0.0 # mosaic probability
 mixup: 0.0 # mixup probability
 cutmix: 0.0 # cutmix probability
-copy_paste: 0.3 # copy-paste probability
+copy_paste: 0.0 # copy-paste probability
 copy_paste_mode: mixup # copy-paste mode
 auto_augment: randaugment # auto augmentation policy
 erasing: 0.4 # random erasing
