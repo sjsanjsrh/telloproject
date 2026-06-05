@@ -1,10 +1,9 @@
+# Training
 epochs: 600 # train epochs
 time: null # time limit, null uses epochs
 patience: 100 # early stopping patience
 batch: 64 # batch size
 imgsz: 480 # input image size
-save: true # save train outputs
-save_period: -1 # checkpoint period, -1 uses default
 cache: ram # dataset cache mode
 device: '0' # train device
 workers: 8 # dataloader workers
@@ -26,9 +25,8 @@ profile: false # profile speed
 freeze: null # freeze layers
 multi_scale: 0.0 # multi-scale training
 compile: false # torch compile
-overlap_mask: true # allow overlapping masks
-mask_ratio: 4 # mask downsample ratio
-dropout: 0.0 # dropout rate
+
+# Validation
 val: true # run validation
 split: val # validation split
 save_json: false # save COCO json results
@@ -46,6 +44,11 @@ show_labels: true # draw labels on plots
 show_conf: true # draw confidence on plots
 show_boxes: true # draw boxes on plots
 line_width: null # plot line width
+
+# Optimization / Loss
+overlap_mask: true # allow overlapping masks
+mask_ratio: 4 # mask downsample ratio
+dropout: 0.0 # dropout rate
 lr0: 0.01 # initial learning rate
 lrf: 0.01 # final LR factor
 momentum: 0.937 # momentum
@@ -62,6 +65,8 @@ kobj: 1.0 # keypoint obj loss weight
 rle: 1.0 # RLE related weight
 angle: 1.0 # angle loss weight
 nbs: 64 # nominal batch size
+
+# Augmentation
 hsv_h: 0.015 # hue augmentation
 hsv_s: 1.0 # saturation augmentation
 hsv_v: 0.5 # value augmentation
@@ -79,4 +84,4 @@ cutmix: 0.0 # cutmix probability
 copy_paste: 0.0 # copy-paste probability
 copy_paste_mode: mixup # copy-paste mode
 auto_augment: randaugment # auto augmentation policy
-erasing: 0.4 # random erasing
+erasing: 0.2 # random erasing
