@@ -13,6 +13,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from yolo_seg.prepare_coco import split_coco
 
+ARGS_YAML = CURRENT_DIR / 'args.yaml'
+
 
 def resolve_cli_path(path_text: str, must_exist: bool = False) -> Path:
     candidate = Path(path_text)
@@ -42,6 +44,8 @@ def resolve_output_path(path_text: str) -> Path:
 
 def parse_args():
     p = argparse.ArgumentParser()
+    p.add_argument('--args-yaml', default=str(ARGS_YAML), help='YOLO hyperparameter YAML path')
+    p.add_argument('--model', default='yolo26n-seg.pt', help='initial YOLO model/weights path')
     p.add_argument('--data', default='yolo_seg/data/result_coco.json', help='data path (COCO JSON or Ultralytics data.yaml)')
     p.add_argument('--preprocess', action='store_true', help='Run random 4:3 crop preprocessing before training')
     p.add_argument('--images', default='data/img', help='source images folder for preprocessing')
@@ -49,10 +53,10 @@ def parse_args():
     p.add_argument('--out', default='yolo_seg/res/data_cropped', help='output folder for preprocessed data')
     p.add_argument('--min-scale', type=float, default=0.6, help='min crop scale for preprocessing')
     p.add_argument('--trials', type=int, default=1, help='number of crops per image')
-    p.add_argument('--epochs', type=int, default=100)
-    p.add_argument('--imgsz', type=int, default=416)
-    p.add_argument('--batch', type=int, default=4)
-    p.add_argument('--device', default='cpu', help='training device, e.g. cpu or cuda:0')
+    p.add_argument('--epochs', type=int, default=None)
+    p.add_argument('--imgsz', type=int, default=None)
+    p.add_argument('--batch', type=int, default=None)
+    p.add_argument('--device', default=None, help='training device, e.g. cpu or cuda:0')
     p.add_argument('--workers', type=int, default=None, help='number of dataloader worker processes; omit to use Ultralytics default')
     return p.parse_args()
 
@@ -104,6 +108,7 @@ def main():
         raise ValueError('--workers must be 0 or greater')
 
     cwd = REPO_ROOT
+    args_yaml_path = resolve_cli_path(args.args_yaml, must_exist=False)
     data_source = resolve_cli_path(args.data, must_exist=True)
 
     # preprocess when explicitly requested or when the input is a COCO JSON file
@@ -125,21 +130,28 @@ def main():
         data_to_use = data_source
 
     # 모델 및 데이터 세팅
-    model = YOLO("yolo26n-seg.pt")
+    model = YOLO(args.model)
 
     # 학습 시작
     train_kwargs = dict(
+        cfg=str(args_yaml_path),
         data=str(data_to_use),
-        epochs=args.epochs,
-        imgsz=args.imgsz,
-        batch=args.batch,
-        amp=False,
-        device=args.device,
         project=str(CURRENT_DIR / 'res' / 'runs'),
     )
+    if args.epochs is not None:
+        train_kwargs['epochs'] = args.epochs
+    if args.imgsz is not None:
+        train_kwargs['imgsz'] = args.imgsz
+    if args.batch is not None:
+        train_kwargs['batch'] = args.batch
+    if args.device is not None:
+        train_kwargs['device'] = args.device
     if args.workers is not None:
         train_kwargs['workers'] = args.workers
 
+    print(f'Using args yaml: {args_yaml_path}')
+    print(f'Using model: {args.model}')
+    print(f'Using data: {data_to_use}')
     model.train(**train_kwargs)
 
 
