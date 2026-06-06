@@ -1,0 +1,30 @@
+speed: 50
+
+start:
+  name: hover
+  position_cm: [-8.3, 0, 0]
+  move_cm: [0, 0, 40]
+  speed: 70
+  wait_sec: 1.2
+
+waypoints:
+  - name: waypoint 1
+    move_cm: [80, -15, 30]
+    speed: 90
+    wait_sec: 0.5
+
+  - name: waypoint 2
+    move_cm: [150, 0, -70]
+    speed: 90
+
+  - name: rotate 90
+    rotate_deg: 90
+    wait_sec: 0.5
+
+  - name: waypoint 3
+    move_cm: [80, -28, 70]
+    speed: 90
+
+  - name: waypoint 4
+    move_cm: [142, 0, 0]
+    speed: 90

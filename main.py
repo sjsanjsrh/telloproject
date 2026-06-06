@@ -1,10 +1,14 @@
 from telloController import TelloController
+import argparse
 import time
 import cv2
 import numpy as np
 from camera_calibration.camera_tranceform import CameraTransform
 from pid_controller import DronePIDController
 import math
+from pathlib import Path
+
+import yaml
 
 tello = TelloController()
 CAMERA_DIRECTION = TelloController.CAMERA_DOWNWARD
@@ -25,10 +29,88 @@ TARGET_ERROR_THRESHOLD_CONT = 0.025  # 컨투어 모드에서의 목표 오차 �
 COUNTOUR_HEIGHT = 50
 
 HOLD_TIME = 0.6
+DEFAULT_FLIGHT_PLAN = Path("flight_path.yaml")
 
 target_point = None
 
 tracking_mode = "init"  # "ellipse" or "contour"
+
+DEFAULT_PLAN = {
+    "speed": 50,
+    "start": {
+        "name": "hover",
+        "move_cm": [0, 0, 40],
+        "speed": 70,
+        "wait_sec": 1.2,
+    },
+    "waypoints": [
+        {"name": "waypoint 1", "move_cm": [80, -15, 30], "speed": 90, "wait_sec": 0.5},
+        {"name": "waypoint 2", "move_cm": [150, 0, -70], "speed": 90},
+        {"name": "rotate 90", "rotate_deg": 90, "wait_sec": 0.5},
+        {"name": "waypoint 3", "move_cm": [80, -28, 70], "speed": 90},
+        {"name": "waypoint 4", "move_cm": [142, 0, 0], "speed": 90},
+    ],
+}
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Tello waypoint flight and landing controller")
+    parser.add_argument("--flight-plan", default=str(DEFAULT_FLIGHT_PLAN), help="Flight plan YAML path")
+    return parser.parse_args()
+
+
+def load_flight_plan(path):
+    plan_path = Path(path)
+    if not plan_path.exists():
+        print(f"비행 경로 파일 없음, 기본 경로 사용: {plan_path}")
+        return DEFAULT_PLAN
+
+    with open(plan_path, "r", encoding="utf-8") as file_handle:
+        data = yaml.safe_load(file_handle) or {}
+    return data
+
+
+def vector3(value, field_name):
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise ValueError(f"{field_name} must be [x, y, z]")
+    return int(value[0]), int(value[1]), int(value[2])
+
+
+def execute_flight_step(tello, step, index=None):
+    name = str(step.get("name", f"step {index}" if index is not None else "step"))
+
+    height = tello.get_height()
+    print(f"현재 높이: {height}cm")
+
+    if step.get("move_cm") is not None:
+        x, y, z = vector3(step["move_cm"], f"{name}.move_cm")
+        speed = int(step.get("speed", 70))
+        tello.go_xyz_speed(x, y, z, speed)
+        print(f"{name} 이동 완료: x={x}, y={y}, z={z}, speed={speed}")
+    elif step.get("rotate_deg") is not None:
+        rotate_deg = int(step["rotate_deg"])
+        if rotate_deg >= 0:
+            tello.rotate_clockwise(rotate_deg)
+        else:
+            tello.rotate_counter_clockwise(abs(rotate_deg))
+        print(f"{name} 회전 완료: {rotate_deg}도")
+    elif step.get("wait_sec") is not None:
+        print(f"{name} 대기")
+    else:
+        raise ValueError(f"{name} must define move_cm, rotate_deg, or wait_sec")
+
+    wait_sec = float(step.get("wait_sec", 0.0))
+    if wait_sec > 0.0:
+        time.sleep(wait_sec)
+
+
+def execute_flight_plan(tello, plan):
+    start_step = plan.get("start")
+    if start_step:
+        execute_flight_step(tello, start_step, index=0)
+
+    for index, waypoint in enumerate(plan.get("waypoints", []), start=1):
+        execute_flight_step(tello, waypoint, index=index)
 
 def ellipse_aspect_ratio(ellipse):
     """타원의 장축과 단축 비율을 계산합니다."""
@@ -101,6 +183,9 @@ def frame_callback(frame):
 
 def main():
     global target_point, tracking_mode
+    args = parse_args()
+    flight_plan = load_flight_plan(args.flight_plan)
+
     tello.start(motor_on=False)
     tello.set_video_bitrate(tello.BITRATE_1MBPS)
     tello.set_video_fps(tello.FPS_30)
@@ -110,7 +195,7 @@ def main():
     while not tello.can_read_frame():
         time.sleep(0.1)
     print("드론 연결 성공")
-    tello.set_speed(50)
+    tello.set_speed(int(flight_plan.get("speed", 50)))
     if not tello.can_flight():
         return
     
@@ -118,43 +203,15 @@ def main():
     
     tello.takeoff()
     print("이륙 완료")
-    
-    height = tello.get_height()
-    print(f"현재 높이: {height}cm")
-    tello.go_xyz_speed(0, 0, 40, 70)  # hover
-    print("호버링 완료")
-    time.sleep(1.2)
 
-    height = tello.get_height()
-    print(f"현재 높이: {height}cm")
-    tello.go_xyz_speed(80, -15, 30, 90)  # waypoint 1
-    print("waypoint 1 도달")
-    time.sleep(0.5)
-
-    height = tello.get_height()
-    print(f"현재 높이: {height}cm")
-    tello.go_xyz_speed(150, 0, -70, 90) # waypoint 2
-    print("waypoint 2 도달")
-
-    tello.rotate_clockwise(90)
-    print("90도 회전 완료")
-    time.sleep(0.5)
-
-    height = tello.get_height()
-    print(f"현재 높이: {height}cm")
-    tello.go_xyz_speed(80, -28, 70, 90) # waypoint 3
-    print("waypoint 3 도달")
-
-    height = tello.get_height()
-    print(f"현재 높이: {height}cm")
-    tello.go_xyz_speed(142, 0, 0, 90) # waypoint 4
-    print("waypoint 4 도달")
+    execute_flight_plan(tello, flight_plan)
 
     fly_time = time.time()
     print(f" 비행 시간: {fly_time - start_time:.2f}초")
 
     # 착륙
     print("착륙진행")
+    height = tello.get_height()
     print(f"현재 높이: {height}cm")
     holdtime = HOLD_TIME
     tracking_mode = "ellipse"
