@@ -1,30 +1,32 @@
 speed: 50
 
 start:
-  name: hover
+  name: h
   position_cm: [-8.3, 0, 0]
+  takeoff_name: t
+  takeoff_position_cm: [0, 0, 50]
   move_cm: [0, 0, 40]
   speed: 70
   wait_sec: 1.2
 
 waypoints:
-  - name: waypoint 1
+  - name: w1
     move_cm: [80, -15, 30]
     speed: 90
     wait_sec: 0.5
 
-  - name: waypoint 2
-    move_cm: [150, 0, -70]
+  - name: w2
+    move_cm: [130, 0, -70]
     speed: 90
 
-  - name: rotate 90
+  - name: r90
     rotate_deg: 90
     wait_sec: 0.5
 
-  - name: waypoint 3
+  - name: w3
     move_cm: [80, -28, 70]
     speed: 90
 
-  - name: waypoint 4
+  - name: w4
     move_cm: [142, 0, 0]
     speed: 90

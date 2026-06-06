@@ -39,6 +39,9 @@ DEFAULT_PLAN = {
     "speed": 50,
     "start": {
         "name": "hover",
+        "position_cm": [0, 0, 0],
+        "takeoff_name": "takeoff",
+        "takeoff_position_cm": [0, 0, 80],
         "move_cm": [0, 0, 40],
         "speed": 70,
         "wait_sec": 1.2,
@@ -107,6 +110,10 @@ def execute_flight_step(tello, step, index=None):
 def execute_flight_plan(tello, plan):
     start_step = plan.get("start")
     if start_step:
+        if start_step.get("takeoff_position_cm") is not None:
+            print(f"{start_step.get('takeoff_name', 'takeoff')} 상대 위치: {start_step['takeoff_position_cm']}")
+        elif start_step.get("takeoff_height_cm") is not None:
+            print(f"{start_step.get('takeoff_name', 'takeoff')} 기준 높이: {float(start_step['takeoff_height_cm']):.1f}cm")
         execute_flight_step(tello, start_step, index=0)
 
     for index, waypoint in enumerate(plan.get("waypoints", []), start=1):

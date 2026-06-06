@@ -33,6 +33,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from camera_calibration.camera_tranceform import load_camera_params
 from telloController import TelloController
+from yolo_seg.flight_plan import flight_plan_points, load_flight_plan
 from yolo_seg.pnp_pos_est import SquarePoseDetection, YoloSquarePoseEstimator
 from yolo_seg.scene_map import Obstacle, SceneMap, load_scene_map
 from yolo_seg.scene_3d_viz import create_scene_3d_visualizer
@@ -42,6 +43,7 @@ from yolo_seg.world_pose import estimate_camera_world_pose
 DEFAULT_MODEL = "yolo_seg/res/runs/segment/train/weights/best.pt"
 DEFAULT_CAMERA_PARAMS = Path("camera_calibration") / "camera_params.yaml"
 DEFAULT_SCENE_MAP = Path("yolo_seg") / "obstacles.yaml"
+DEFAULT_FLIGHT_PLAN = Path("flight_path.yaml")
 DEFAULT_SQUARE_SIZE_CM = 20.0
 
 
@@ -62,6 +64,7 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--target-width-cm", type=float, default=None, help="Target outer width in cm")
 	parser.add_argument("--target-height-cm", type=float, default=None, help="Target outer height in cm")
 	parser.add_argument("--scene-map", default=str(DEFAULT_SCENE_MAP), help="Scene obstacle YAML path")
+	parser.add_argument("--flight-plan", default=str(DEFAULT_FLIGHT_PLAN), help="Flight path YAML path for 3D visualization")
 	parser.add_argument("--object-id", default=None, help="Known obstacle id from --scene-map, e.g. A, B, or C")
 	parser.add_argument("--object-position-cm", default=None, help="Known target Tello/world position as forward,right,up in cm")
 	parser.add_argument("--object-yaw-deg", type=float, default=0.0, help="Known target yaw around Tello/world up axis")
@@ -456,6 +459,7 @@ def main() -> None:
 	args = parse_args()
 	source = parse_source(args.source)
 	scene_map = load_optional_scene_map(args.scene_map)
+	flight_path_points = flight_plan_points(load_flight_plan(args.flight_plan))
 	config_obstacle = resolve_obstacle(scene_map, args.object_id) or first_obstacle(scene_map)
 	object_position_cm = parse_vector3(args.object_position_cm)
 	object_yaw_deg = args.object_yaw_deg
@@ -493,7 +497,7 @@ def main() -> None:
 	camera_fov_deg = estimate_camera_fov_deg(camera_matrix)
 	scene_3d = (
 		create_scene_3d_visualizer(prefer_gpu=args.scene_3d_renderer == "gpu", camera_fov_deg=camera_fov_deg)
-		if scene_map is not None and not args.no_3d
+		if (scene_map is not None or flight_path_points) and not args.no_3d
 		else None
 	)
 	fps_ema = 0.0
@@ -572,6 +576,7 @@ def main() -> None:
 						if detection is not None and detection.position_tello_cm is not None
 						else last_camera_local_detection_cm
 					),
+					flight_path_points=flight_path_points,
 				)
 			key = cv2.waitKey(1) & 0xFF
 			if scene_3d is not None and hasattr(scene_3d, "handle_key"):

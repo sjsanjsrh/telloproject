@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+import argparse
 import ctypes
 import ctypes.util
 import math
+import sys
+import time
+from pathlib import Path
 
 import cv2
 import numpy as np
 
-from yolo_seg.scene_map import Obstacle, SceneMap
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+	sys.path.insert(0, str(PROJECT_ROOT))
+
+from yolo_seg.flight_plan import flight_plan_points, load_flight_plan
+from yolo_seg.scene_map import Obstacle, SceneMap, load_scene_map
 from yolo_seg.world_pose import CameraWorldPose, opencv_to_tello_vector, yaw_rotation_matrix_z
 
 
@@ -329,12 +338,40 @@ class Scene3DVisualizer:
 			cv2.LINE_AA,
 		)
 
+	def _draw_flight_path(self, image: np.ndarray, flight_path_points):
+		if not flight_path_points:
+			return
+
+		path_color = (40, 170, 255)
+		start_color = (80, 255, 140)
+		takeoff_color = (120, 220, 255)
+		waypoint_color = (255, 220, 80)
+		positions = [np.asarray(point["position_cm"], dtype=np.float64).reshape(3) for point in flight_path_points]
+		for index in range(len(positions) - 1):
+			self._draw_line_3d(image, positions[index], positions[index + 1], path_color, 2)
+		for index, point in enumerate(flight_path_points):
+			position = positions[index]
+			color = {"start": start_color, "takeoff": takeoff_color}.get(point.get("kind"), waypoint_color)
+			center_2d = self._project(position)
+			cv2.circle(image, center_2d, 5, color, -1, cv2.LINE_AA)
+			cv2.putText(
+				image,
+				str(point.get("name", index)),
+				(center_2d[0] + 8, center_2d[1] + 5),
+				cv2.FONT_HERSHEY_SIMPLEX,
+				0.42,
+				color,
+				1,
+				cv2.LINE_AA,
+			)
+
 	def render(
 		self,
 		scene_map: SceneMap | None,
 		active_obstacle: Obstacle | None = None,
 		camera_pose: CameraWorldPose | None = None,
 		camera_local_detection_cm=None,
+		flight_path_points=None,
 	) -> np.ndarray:
 		image = np.zeros((self.height, self.width, 3), dtype=np.uint8)
 		image[:] = (20, 22, 24)
@@ -344,6 +381,7 @@ class Scene3DVisualizer:
 			for obstacle in scene_map.obstacles.values():
 				self._draw_shape(image, obstacle, active=active_obstacle is not None and obstacle.id == active_obstacle.id)
 
+		self._draw_flight_path(image, flight_path_points)
 		self._draw_camera_pose(image, camera_pose)
 		self._draw_camera_local_detection(image, camera_local_detection_cm)
 		cv2.putText(image, "3D scene map", (18, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (235, 235, 235), 2, cv2.LINE_AA)
@@ -355,8 +393,10 @@ class Scene3DVisualizer:
 		active_obstacle: Obstacle | None = None,
 		camera_pose: CameraWorldPose | None = None,
 		camera_local_detection_cm=None,
+		flight_path_points=None,
 	):
-		cv2.imshow(self.window_name, self.render(scene_map, active_obstacle, camera_pose, camera_local_detection_cm))
+		cv2.imshow(self.window_name, self.render(scene_map, active_obstacle, camera_pose, camera_local_detection_cm, flight_path_points))
+		return True
 
 	def handle_key(self, key: int):
 		if key in (ord("a"), ord("A")):
@@ -668,6 +708,23 @@ class OpenGLScene3DVisualizer:
 		self._draw_cube(position, 6.0, (255, 80, 220))
 		self._label(f"tello {position[0]:.0f},{position[1]:.0f},{position[2]:.0f}", position + np.array([8.0, 8.0, 0.0]), (255, 80, 220))
 
+	def _draw_flight_path(self, flight_path_points):
+		if not flight_path_points:
+			return
+
+		path_color = (40, 170, 255)
+		start_color = (80, 255, 140)
+		takeoff_color = (120, 220, 255)
+		waypoint_color = (255, 220, 80)
+		positions = [np.asarray(point["position_cm"], dtype=np.float64).reshape(3) for point in flight_path_points]
+		for index in range(len(positions) - 1):
+			self._line(positions[index], positions[index + 1], path_color, 3.0)
+		for index, point in enumerate(flight_path_points):
+			position = positions[index]
+			color = {"start": start_color, "takeoff": takeoff_color}.get(point.get("kind"), waypoint_color)
+			self._draw_cube(position, 4.0, color)
+			self._label(str(point.get("name", index)), position + np.array([8.0, 8.0, 5.0]), color)
+
 	def _draw_cube(self, center, radius: float, color):
 		gl = self._gl
 		center = np.asarray(center, dtype=np.float64).reshape(3)
@@ -711,10 +768,11 @@ class OpenGLScene3DVisualizer:
 		active_obstacle: Obstacle | None = None,
 		camera_pose: CameraWorldPose | None = None,
 		camera_local_detection_cm=None,
+		flight_path_points=None,
 	):
 		for event in self._pygame.event.get():
 			if event.type == self._pygame.QUIT:
-				return
+				return False
 			if event.type == self._pygame.KEYDOWN:
 				self.handle_key(event.key)
 
@@ -725,6 +783,53 @@ class OpenGLScene3DVisualizer:
 		if scene_map is not None:
 			for obstacle in scene_map.obstacles.values():
 				self._draw_shape(obstacle, active=active_obstacle is not None and obstacle.id == active_obstacle.id)
+		self._draw_flight_path(flight_path_points)
 		self._draw_camera_pose(camera_pose)
 		self._draw_camera_local_detection(camera_local_detection_cm)
 		self._pygame.display.flip()
+		return True
+
+
+def parse_viewer_args() -> argparse.Namespace:
+	parser = argparse.ArgumentParser(description="Standalone 3D scene and flight path viewer")
+	parser.add_argument("--scene-map", default=str(Path("yolo_seg") / "obstacles.yaml"), help="Scene obstacle YAML path")
+	parser.add_argument("--flight-plan", default="flight_path.yaml", help="Flight path YAML path")
+	parser.add_argument("--renderer", default="gpu", choices=("gpu", "cpu"), help="3D renderer backend")
+	parser.add_argument("--width", type=int, default=720, help="Viewer window width")
+	parser.add_argument("--height", type=int, default=540, help="Viewer window height")
+	return parser.parse_args()
+
+
+def load_optional_scene_map(path: str | Path) -> SceneMap | None:
+	scene_path = Path(path)
+	if not path or not scene_path.exists():
+		return None
+	return load_scene_map(scene_path)
+
+
+def main() -> None:
+	args = parse_viewer_args()
+	scene_map = load_optional_scene_map(args.scene_map)
+	points = flight_plan_points(load_flight_plan(args.flight_plan))
+	viewer = create_scene_3d_visualizer(
+		width=args.width,
+		height=args.height,
+		prefer_gpu=args.renderer == "gpu",
+	)
+
+	while True:
+		keep_open = viewer.show(scene_map, flight_path_points=points)
+		if keep_open is False:
+			break
+		key = cv2.waitKey(16) & 0xFF
+		if hasattr(viewer, "handle_key"):
+			viewer.handle_key(key)
+		if key in (27, ord("q")):
+			break
+		time.sleep(0.01)
+
+	cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+	main()
