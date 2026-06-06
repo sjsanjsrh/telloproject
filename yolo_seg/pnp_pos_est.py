@@ -14,10 +14,18 @@ Typical usage:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Optional
 
 import cv2
 import numpy as np
+
+from yolo_seg.geometry import (
+	contour_center,
+	contour_from_polygon,
+	contour_to_square_corners,
+	contours_from_mask,
+)
+from yolo_seg.world_pose import opencv_to_tello_vector
 
 
 @dataclass
@@ -44,140 +52,12 @@ class SquarePoseDetection:
 		flat = self.tvec.reshape(-1)
 		return float(flat[0]), float(flat[1]), float(flat[2])
 
-
-@dataclass
-class CameraWorldPose:
-	"""Camera pose estimated from a known target pose in world coordinates."""
-
-	position_cm: tuple[float, float, float]
-	rotation_matrix: np.ndarray
-	method: str
-
-
-def order_points(points: np.ndarray) -> np.ndarray:
-	"""Order four points as top-left, top-right, bottom-right, bottom-left."""
-
-	pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
-	if pts.shape[0] != 4:
-		raise ValueError("order_points expects exactly 4 points")
-
-	ordered = np.zeros((4, 2), dtype=np.float32)
-	point_sums = pts.sum(axis=1)
-	point_diffs = np.diff(pts, axis=1).reshape(-1)
-
-	ordered[0] = pts[np.argmin(point_sums)]
-	ordered[2] = pts[np.argmax(point_sums)]
-	ordered[1] = pts[np.argmin(point_diffs)]
-	ordered[3] = pts[np.argmax(point_diffs)]
-	return ordered
-
-
-def contour_from_polygon(polygon: Sequence[Sequence[float]]) -> np.ndarray:
-	"""Convert a polygon to an OpenCV contour."""
-
-	contour = np.asarray(polygon, dtype=np.float32).reshape(-1, 1, 2)
-	return contour
-
-
-def contour_center(contour: np.ndarray) -> tuple[float, float]:
-	moments = cv2.moments(contour)
-	if moments["m00"] != 0:
-		return float(moments["m10"] / moments["m00"]), float(moments["m01"] / moments["m00"])
-	pts = contour.reshape(-1, 2)
-	center = pts.mean(axis=0)
-	return float(center[0]), float(center[1])
-
-
-def yaw_rotation_matrix_y(yaw_deg: float) -> np.ndarray:
-	"""Rotation around OpenCV's vertical image/object Y axis."""
-
-	yaw = np.deg2rad(float(yaw_deg))
-	cos_yaw = np.cos(yaw)
-	sin_yaw = np.sin(yaw)
-	return np.array(
-		[
-			[cos_yaw, 0.0, sin_yaw],
-			[0.0, 1.0, 0.0],
-			[-sin_yaw, 0.0, cos_yaw],
-		],
-		dtype=np.float64,
-	)
-
-
-def estimate_camera_world_pose(
-	detection: SquarePoseDetection,
-	object_position_cm: Sequence[float],
-	object_yaw_deg: float = 0.0,
-) -> Optional[CameraWorldPose]:
-	"""Estimate camera world pose from a known target world pose.
-
-	OpenCV solvePnP returns object-to-camera pose: X_camera = R * X_object + t.
-	This function inverts that transform, then places it at the known object pose.
-	For rough outline detections without rvec, it assumes object and camera axes
-	are roughly aligned and uses tvec only.
-	"""
-
-	if detection.tvec is None:
-		return None
-
-	object_position = np.asarray(object_position_cm, dtype=np.float64).reshape(3)
-	t_obj_in_cam = np.asarray(detection.tvec, dtype=np.float64).reshape(3, 1)
-	if detection.rvec is None:
-		r_obj_to_cam = np.eye(3, dtype=np.float64)
-	else:
-		r_obj_to_cam, _jacobian = cv2.Rodrigues(np.asarray(detection.rvec, dtype=np.float64))
-
-	r_cam_to_obj = r_obj_to_cam.T
-	camera_position_obj = (-r_cam_to_obj @ t_obj_in_cam).reshape(3)
-
-	r_world_obj = yaw_rotation_matrix_y(object_yaw_deg)
-	camera_position_world = object_position + (r_world_obj @ camera_position_obj)
-	r_world_cam = r_world_obj @ r_cam_to_obj
-	return CameraWorldPose(
-		position_cm=tuple(float(value) for value in camera_position_world),
-		rotation_matrix=r_world_cam,
-		method=detection.pose_method,
-	)
-
-
-def contour_to_square_corners(contour: np.ndarray) -> Optional[np.ndarray]:
-	"""Estimate four corners from a contour.
-
-	We first try polygon approximation. If the contour does not simplify to a
-	clean quadrilateral, we fall back to the minimum-area rectangle.
-	"""
-
-	if contour is None or len(contour) < 4:
-		return None
-
-	contour_float = np.asarray(contour, dtype=np.float32)
-	perimeter = cv2.arcLength(contour_float, True)
-	approx = cv2.approxPolyDP(contour_float, 0.02 * perimeter, True)
-
-	if len(approx) == 4 and cv2.isContourConvex(approx):
-		return order_points(approx.reshape(-1, 2))
-
-	rect = cv2.minAreaRect(contour_float)
-	box = cv2.boxPoints(rect)
-	return order_points(box)
-
-
-def contours_from_mask(mask: np.ndarray, output_shape: Optional[tuple[int, int]] = None) -> list[np.ndarray]:
-	"""Extract outer contours from a binary mask."""
-	binary_mask = (np.asarray(mask) > 0).astype(np.uint8)
-	if binary_mask.ndim != 2:
-		raise ValueError("contours_from_mask expects a 2D mask")
-	if output_shape is not None and binary_mask.shape[:2] != output_shape:
-		binary_mask = cv2.resize(
-			binary_mask,
-			(output_shape[1], output_shape[0]),
-			interpolation=cv2.INTER_NEAREST,
-		)
-
-	contours, _hierarchy = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-	contours = [contour for contour in contours if cv2.contourArea(contour) > 0]
-	contours.sort(key=cv2.contourArea, reverse=True)
-	return contours
+	@property
+	def position_tello_cm(self) -> Optional[tuple[float, float, float]]:
+		if self.tvec is None:
+			return None
+		flat = opencv_to_tello_vector(self.tvec)
+		return float(flat[0]), float(flat[1]), float(flat[2])
 
 
 class YoloSquarePoseEstimator:
@@ -188,6 +68,8 @@ class YoloSquarePoseEstimator:
 		camera_matrix: np.ndarray,
 		dist_coeffs: np.ndarray,
 		square_size_cm: float,
+		target_width_cm: Optional[float] = None,
+		target_height_cm: Optional[float] = None,
 		target_class_id: Optional[int] = None,
 		target_class_name: Optional[str] = None,
 		outline_class_id: Optional[int] = None,
@@ -198,6 +80,8 @@ class YoloSquarePoseEstimator:
 		self.camera_matrix = np.asarray(camera_matrix, dtype=np.float64)
 		self.dist_coeffs = np.asarray(dist_coeffs, dtype=np.float64).reshape(-1, 1)
 		self.square_size_cm = float(square_size_cm)
+		self.target_width_cm = float(target_width_cm) if target_width_cm is not None else self.square_size_cm
+		self.target_height_cm = float(target_height_cm) if target_height_cm is not None else self.square_size_cm
 		self.target_class_id = target_class_id
 		self.target_class_name = target_class_name
 		self.outline_class_id = outline_class_id
@@ -308,13 +192,14 @@ class YoloSquarePoseEstimator:
 		return candidates
 
 	def _estimate_pose(self, corners_px: np.ndarray) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-		half = self.square_size_cm / 2.0
+		half_width = self.target_width_cm / 2.0
+		half_height = self.target_height_cm / 2.0
 		object_points = np.array(
 			[
-				[-half, -half, 0.0],
-				[half, -half, 0.0],
-				[half, half, 0.0],
-				[-half, half, 0.0],
+				[-half_width, -half_height, 0.0],
+				[half_width, -half_height, 0.0],
+				[half_width, half_height, 0.0],
+				[-half_width, half_height, 0.0],
 			],
 			dtype=np.float32,
 		)
@@ -437,6 +322,8 @@ def estimate_square_pose_from_result(
 	camera_matrix: np.ndarray,
 	dist_coeffs: np.ndarray,
 	square_size_cm: float,
+	target_width_cm: Optional[float] = None,
+	target_height_cm: Optional[float] = None,
 	target_class_id: Optional[int] = None,
 	target_class_name: Optional[str] = None,
 	outline_class_id: Optional[int] = None,
@@ -450,6 +337,8 @@ def estimate_square_pose_from_result(
 		camera_matrix=camera_matrix,
 		dist_coeffs=dist_coeffs,
 		square_size_cm=square_size_cm,
+		target_width_cm=target_width_cm,
+		target_height_cm=target_height_cm,
 		target_class_id=target_class_id,
 		target_class_name=target_class_name,
 		outline_class_id=outline_class_id,

@@ -1,0 +1,37 @@
+world:
+  unit: cm
+  axis: tello
+
+obstacles:
+  - id: A
+    class_name: A
+    position_cm: [100, 0, 100]
+    yaw_deg: 0
+    shape:
+      type: rectangle_frame
+      size_cm:
+        width: 80
+        height: 75
+      thickness_cm: 3
+
+  - id: B
+    class_name: B
+    position_cm: [200, 0, 50]
+    yaw_deg: 45
+    shape:
+      type: rectangle_frame
+      size_cm:
+        width: 80
+        height: 75
+      thickness_cm: 3
+
+  - id: C
+    class_name: C
+    position_cm: [200, 100, 100]
+    yaw_deg: 90
+    shape:
+      type: rectangle_frame
+      size_cm:
+        width: 80
+        height: 75
+      thickness_cm: 3

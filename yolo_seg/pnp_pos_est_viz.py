@@ -33,11 +33,15 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from camera_calibration.camera_tranceform import load_camera_params
 from telloController import TelloController
-from yolo_seg.pnp_pos_est import SquarePoseDetection, YoloSquarePoseEstimator, estimate_camera_world_pose
+from yolo_seg.pnp_pos_est import SquarePoseDetection, YoloSquarePoseEstimator
+from yolo_seg.scene_map import Obstacle, SceneMap, load_scene_map
+from yolo_seg.scene_3d_viz import create_scene_3d_visualizer
+from yolo_seg.world_pose import estimate_camera_world_pose
 
 
 DEFAULT_MODEL = "yolo_seg/res/runs/segment/train/weights/best.pt"
 DEFAULT_CAMERA_PARAMS = Path("camera_calibration") / "camera_params.yaml"
+DEFAULT_SCENE_MAP = Path("yolo_seg") / "obstacles.yaml"
 DEFAULT_SQUARE_SIZE_CM = 20.0
 
 
@@ -55,8 +59,12 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--outline-class-id", type=int, default=None, help="Partial outline class id for rough thickness-based pose")
 	parser.add_argument("--outline-class-name", default=None, help="Partial outline class name for rough thickness-based pose")
 	parser.add_argument("--outline-thickness-cm", type=float, default=None, help="Real outline stroke thickness in cm")
-	parser.add_argument("--object-position-cm", default=None, help="Known target world position as x,y,z in cm")
-	parser.add_argument("--object-yaw-deg", type=float, default=0.0, help="Known target yaw angle in world coordinates")
+	parser.add_argument("--target-width-cm", type=float, default=None, help="Target outer width in cm")
+	parser.add_argument("--target-height-cm", type=float, default=None, help="Target outer height in cm")
+	parser.add_argument("--scene-map", default=str(DEFAULT_SCENE_MAP), help="Scene obstacle YAML path")
+	parser.add_argument("--object-id", default=None, help="Known obstacle id from --scene-map, e.g. A, B, or C")
+	parser.add_argument("--object-position-cm", default=None, help="Known target Tello/world position as forward,right,up in cm")
+	parser.add_argument("--object-yaw-deg", type=float, default=0.0, help="Known target yaw around Tello/world up axis")
 	parser.add_argument("--camera-direction", default="forward", choices=("forward", "downward"), help="Tello camera direction when using --source tello")
 	parser.add_argument("--video-resolution", type=int, default=480, choices=(480, 720), help="Tello video resolution when using --source tello")
 	parser.add_argument("--min-area-px", type=float, default=200.0, help="Minimum contour area in pixels")
@@ -65,6 +73,8 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--device", default="auto", help="Inference device, e.g. auto, intel:NPU, cpu")
 	parser.add_argument("--panel-height", type=int, default=360, help="Output panel height")
 	parser.add_argument("--window-name", default="pnp_pos_est_horizontal", help="OpenCV window name")
+	parser.add_argument("--no-3d", action="store_true", help="Disable the separate 3D scene window")
+	parser.add_argument("--3d-renderer", dest="scene_3d_renderer", default="gpu", choices=("gpu", "cpu"), help="3D scene renderer backend")
 	return parser.parse_args()
 
 
@@ -143,8 +153,49 @@ def parse_vector3(value: Optional[str]) -> Optional[tuple[float, float, float]]:
 		return None
 	parts = [part.strip() for part in value.split(",")]
 	if len(parts) != 3:
-		raise ValueError("--object-position-cm must look like x,y,z")
+		raise ValueError("--object-position-cm must look like forward,right,up")
 	return float(parts[0]), float(parts[1]), float(parts[2])
+
+
+def estimate_camera_fov_deg(camera_matrix: np.ndarray) -> tuple[float, float]:
+	fx = float(camera_matrix[0, 0])
+	fy = float(camera_matrix[1, 1])
+	cx = float(camera_matrix[0, 2])
+	cy = float(camera_matrix[1, 2])
+	image_width = max(1.0, cx * 2.0)
+	image_height = max(1.0, cy * 2.0)
+	hfov_deg = float(np.degrees(2.0 * np.arctan(image_width / (2.0 * fx))))
+	vfov_deg = float(np.degrees(2.0 * np.arctan(image_height / (2.0 * fy))))
+	return hfov_deg, vfov_deg
+
+
+def load_optional_scene_map(path: Optional[str]) -> Optional[SceneMap]:
+	if not path:
+		return None
+	scene_path = Path(path)
+	if not scene_path.exists():
+		return None
+	return load_scene_map(scene_path)
+
+
+def first_obstacle(scene_map: Optional[SceneMap]) -> Optional[Obstacle]:
+	if scene_map is None or not scene_map.obstacles:
+		return None
+	return next(iter(scene_map.obstacles.values()))
+
+
+def resolve_obstacle(
+	scene_map: Optional[SceneMap],
+	object_id: Optional[str],
+	detection: Optional[SquarePoseDetection] = None,
+) -> Optional[Obstacle]:
+	if scene_map is None:
+		return None
+	if object_id:
+		return scene_map.get(object_id)
+	if detection is None:
+		return None
+	return scene_map.match_detection(detection.class_id, detection.class_name)
 
 
 class TelloStreamCapture:
@@ -234,9 +285,9 @@ def add_detection_info(frame: np.ndarray, detection: Optional[SquarePoseDetectio
 		label = f"{detection.class_name} {label}"
 	cv2.putText(output, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
 
-	if detection.position_cm is not None:
-		x, y, z = detection.position_cm
-		pose_label = f"tvec=({x:.1f}, {y:.1f}, {z:.1f}) cm"
+	if detection.position_tello_cm is not None:
+		x, y, z = detection.position_tello_cm
+		pose_label = f"tello=({x:.1f}, {y:.1f}, {z:.1f}) cm"
 		cv2.putText(output, pose_label, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
 
 	return output
@@ -350,11 +401,11 @@ def build_horizontal_dashboard(
 			f"square size: {estimator.square_size_cm:.1f}cm",
 		]
 	else:
-		position = detection.position_cm
+		position = detection.position_tello_cm
 		if position is None:
-			position_text = "tvec: unavailable"
+			position_text = "tello tvec: unavailable"
 		else:
-			position_text = f"tvec cm: {position[0]:.1f}, {position[1]:.1f}, {position[2]:.1f}"
+			position_text = f"tello cm: X {position[0]:.1f}, Y {position[1]:.1f}, Z {position[2]:.1f}"
 		thickness_text = "thickness px: n/a"
 		if detection.thickness_px is not None:
 			thickness_text = f"thickness px: {detection.thickness_px:.1f}"
@@ -400,7 +451,13 @@ def open_capture(source, camera_direction: str, video_resolution: int):
 def main() -> None:
 	args = parse_args()
 	source = parse_source(args.source)
+	scene_map = load_optional_scene_map(args.scene_map)
+	config_obstacle = resolve_obstacle(scene_map, args.object_id) or first_obstacle(scene_map)
 	object_position_cm = parse_vector3(args.object_position_cm)
+	object_yaw_deg = args.object_yaw_deg
+	if object_position_cm is None and config_obstacle is not None:
+		object_position_cm = config_obstacle.position_cm
+		object_yaw_deg = config_obstacle.yaw_deg
 	calibration_camera = args.camera
 	calibration_resolution = args.resolution
 	if source == "tello":
@@ -417,18 +474,28 @@ def main() -> None:
 		camera_matrix=camera_matrix,
 		dist_coeffs=dist_coeffs,
 		square_size_cm=args.square_size_cm,
+		target_width_cm=args.target_width_cm or (config_obstacle.shape.width_cm if config_obstacle is not None else None),
+		target_height_cm=args.target_height_cm or (config_obstacle.shape.height_cm if config_obstacle is not None else None),
 		target_class_id=args.target_class_id,
 		target_class_name=args.target_class_name,
 		outline_class_id=args.outline_class_id,
 		outline_class_name=args.outline_class_name,
-		outline_thickness_cm=args.outline_thickness_cm,
+		outline_thickness_cm=args.outline_thickness_cm or (config_obstacle.shape.thickness_cm if config_obstacle is not None else None),
 		min_area_px=args.min_area_px,
 	)
 
 	model, inference_device = _resolve_inference_model(args.model, args.device, args.imgsz)
 	capture = open_capture(source, args.camera_direction, args.video_resolution)
+	camera_fov_deg = estimate_camera_fov_deg(camera_matrix)
+	scene_3d = (
+		create_scene_3d_visualizer(prefer_gpu=args.scene_3d_renderer == "gpu", camera_fov_deg=camera_fov_deg)
+		if scene_map is not None and not args.no_3d
+		else None
+	)
 	fps_ema = 0.0
 	last_postprocess_ms = 0.0
+	last_camera_world_pose = None
+	last_camera_local_detection_cm = None
 
 	try:
 		while True:
@@ -446,6 +513,26 @@ def main() -> None:
 
 			postprocess_start = perf_counter()
 			detection = estimator.estimate_from_result(result) if result is not None else None
+			detection_obstacle = resolve_obstacle(scene_map, args.object_id, detection)
+			reference_obstacle = detection_obstacle or config_obstacle
+			dashboard_object_position_cm = object_position_cm
+			dashboard_object_yaw_deg = object_yaw_deg
+			if args.object_position_cm is None and reference_obstacle is not None:
+				dashboard_object_position_cm = reference_obstacle.position_cm
+				dashboard_object_yaw_deg = reference_obstacle.yaw_deg
+			camera_world_pose = None
+			if detection is not None and dashboard_object_position_cm is not None:
+				camera_world_pose = estimate_camera_world_pose(
+					detection,
+					dashboard_object_position_cm,
+					dashboard_object_yaw_deg,
+				)
+			if camera_world_pose is not None:
+				last_camera_world_pose = camera_world_pose
+			if detection is not None and detection.position_tello_cm is not None:
+				last_camera_local_detection_cm = detection.position_tello_cm
+			elif detection is not None and detection.position_cm is not None:
+				last_camera_local_detection_cm = detection.position_cm
 			dashboard = build_horizontal_dashboard(
 				frame=frame,
 				result=result,
@@ -457,8 +544,8 @@ def main() -> None:
 				inference_ms=inference_ms,
 				postprocess_ms=last_postprocess_ms,
 				fps=fps_ema,
-				object_position_cm=object_position_cm,
-				object_yaw_deg=args.object_yaw_deg,
+				object_position_cm=dashboard_object_position_cm,
+				object_yaw_deg=dashboard_object_yaw_deg,
 			)
 			last_postprocess_ms = (perf_counter() - postprocess_start) * 1000.0
 
@@ -471,7 +558,20 @@ def main() -> None:
 				fps_ema = 0.0
 
 			cv2.imshow(args.window_name, dashboard)
+			if scene_3d is not None:
+				scene_3d.show(
+					scene_map,
+					active_obstacle=detection_obstacle,
+					camera_pose=camera_world_pose if camera_world_pose is not None else last_camera_world_pose,
+					camera_local_detection_cm=(
+						detection.position_tello_cm
+						if detection is not None and detection.position_tello_cm is not None
+						else last_camera_local_detection_cm
+					),
+				)
 			key = cv2.waitKey(1) & 0xFF
+			if scene_3d is not None and hasattr(scene_3d, "handle_key"):
+				scene_3d.handle_key(key)
 			if key in (27, ord("q")):
 				break
 	finally:
