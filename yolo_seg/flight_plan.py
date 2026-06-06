@@ -86,3 +86,46 @@ def flight_plan_points(plan: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
 			yaw_deg += float(step["rotate_deg"])
 
 	return points
+
+
+def nearest_path_point(points: list[dict[str, Any]], position_cm) -> Optional[dict[str, Any]]:
+	if not points:
+		return None
+
+	position = np.asarray(position_cm, dtype=np.float64).reshape(3)
+	positions = [np.asarray(point["position_cm"], dtype=np.float64).reshape(3) for point in points]
+
+	if len(positions) == 1:
+		distance = float(np.linalg.norm(position - positions[0]))
+		return {
+			"name": str(points[0].get("name", "path")),
+			"position_cm": tuple(float(value) for value in positions[0]),
+			"distance_cm": distance,
+			"segment_index": 0,
+		}
+
+	best_position = positions[0]
+	best_distance = float(np.linalg.norm(position - best_position))
+	best_index = 0
+	for index in range(len(positions) - 1):
+		start = positions[index]
+		end = positions[index + 1]
+		segment = end - start
+		segment_length_sq = float(segment @ segment)
+		if segment_length_sq <= 1e-9:
+			candidate = start
+		else:
+			t = float(np.clip(((position - start) @ segment) / segment_length_sq, 0.0, 1.0))
+			candidate = start + segment * t
+		distance = float(np.linalg.norm(position - candidate))
+		if distance < best_distance:
+			best_position = candidate
+			best_distance = distance
+			best_index = index
+
+	return {
+		"name": f"path {best_index + 1}",
+		"position_cm": tuple(float(value) for value in best_position),
+		"distance_cm": best_distance,
+		"segment_index": best_index,
+	}

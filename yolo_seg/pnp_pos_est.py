@@ -44,6 +44,7 @@ class SquarePoseDetection:
 	class_name: Optional[str] = None
 	pose_method: str = "pnp"
 	thickness_px: Optional[float] = None
+	pose_confidence: float = 0.0
 
 	@property
 	def position_cm(self) -> Optional[tuple[float, float, float]]:
@@ -243,6 +244,22 @@ class YoloSquarePoseEstimator:
 		tvec = np.array([[x_cm], [y_cm], [z_cm]], dtype=np.float64)
 		return None, tvec, thickness_px
 
+	def _pose_confidence(
+		self,
+		pose_method: str,
+		detection_confidence: float,
+		area_px: float,
+		has_pose: bool,
+	) -> float:
+		if not has_pose:
+			return 0.0
+
+		area_quality = min(1.0, max(0.0, area_px / max(self.min_area_px * 8.0, 1.0)))
+		det_quality = min(1.0, max(0.0, detection_confidence))
+		method_weight = 1.0 if pose_method == "pnp" else 0.28
+		quality = (0.35 + 0.65 * det_quality) * (0.35 + 0.65 * area_quality)
+		return float(min(1.0, method_weight * quality))
+
 	def estimate_from_result(self, result) -> Optional[SquarePoseDetection]:
 		"""Estimate the best square detection from a YOLO result object."""
 
@@ -280,6 +297,12 @@ class YoloSquarePoseEstimator:
 				thickness_px = None
 				pose_method = "pnp"
 			score = contour_area * max(confidence, 1e-6)
+			pose_confidence = self._pose_confidence(
+				pose_method=pose_method,
+				detection_confidence=float(confidence),
+				area_px=contour_area,
+				has_pose=tvec is not None,
+			)
 
 			detection = SquarePoseDetection(
 				center_px=center_px,
@@ -294,6 +317,7 @@ class YoloSquarePoseEstimator:
 				class_name=class_name,
 				pose_method=pose_method,
 				thickness_px=thickness_px,
+				pose_confidence=pose_confidence,
 			)
 
 			if best_detection is None or detection.score > best_detection.score:

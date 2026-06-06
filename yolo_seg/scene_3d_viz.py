@@ -338,6 +338,26 @@ class Scene3DVisualizer:
 			cv2.LINE_AA,
 		)
 
+	def _draw_pose_markers(self, image: np.ndarray, pose_markers):
+		if not pose_markers:
+			return
+		for marker in pose_markers:
+			position = np.asarray(marker["position_cm"], dtype=np.float64).reshape(3)
+			color = tuple(int(value) for value in marker.get("color_bgr", (255, 255, 255)))
+			label = str(marker.get("label", "pose"))
+			center_2d = self._project(position)
+			cv2.circle(image, center_2d, 7, color, -1, cv2.LINE_AA)
+			cv2.putText(
+				image,
+				label,
+				(center_2d[0] + 9, center_2d[1] + 6),
+				cv2.FONT_HERSHEY_SIMPLEX,
+				0.5,
+				color,
+				2,
+				cv2.LINE_AA,
+			)
+
 	def _draw_flight_path(self, image: np.ndarray, flight_path_points):
 		if not flight_path_points:
 			return
@@ -372,6 +392,7 @@ class Scene3DVisualizer:
 		camera_pose: CameraWorldPose | None = None,
 		camera_local_detection_cm=None,
 		flight_path_points=None,
+		pose_markers=None,
 	) -> np.ndarray:
 		image = np.zeros((self.height, self.width, 3), dtype=np.uint8)
 		image[:] = (20, 22, 24)
@@ -382,6 +403,7 @@ class Scene3DVisualizer:
 				self._draw_shape(image, obstacle, active=active_obstacle is not None and obstacle.id == active_obstacle.id)
 
 		self._draw_flight_path(image, flight_path_points)
+		self._draw_pose_markers(image, pose_markers)
 		self._draw_camera_pose(image, camera_pose)
 		self._draw_camera_local_detection(image, camera_local_detection_cm)
 		cv2.putText(image, "3D scene map", (18, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (235, 235, 235), 2, cv2.LINE_AA)
@@ -394,8 +416,9 @@ class Scene3DVisualizer:
 		camera_pose: CameraWorldPose | None = None,
 		camera_local_detection_cm=None,
 		flight_path_points=None,
+		pose_markers=None,
 	):
-		cv2.imshow(self.window_name, self.render(scene_map, active_obstacle, camera_pose, camera_local_detection_cm, flight_path_points))
+		cv2.imshow(self.window_name, self.render(scene_map, active_obstacle, camera_pose, camera_local_detection_cm, flight_path_points, pose_markers))
 		return True
 
 	def handle_key(self, key: int):
@@ -708,6 +731,16 @@ class OpenGLScene3DVisualizer:
 		self._draw_cube(position, 6.0, (255, 80, 220))
 		self._label(f"tello {position[0]:.0f},{position[1]:.0f},{position[2]:.0f}", position + np.array([8.0, 8.0, 0.0]), (255, 80, 220))
 
+	def _draw_pose_markers(self, pose_markers):
+		if not pose_markers:
+			return
+		for marker in pose_markers:
+			position = np.asarray(marker["position_cm"], dtype=np.float64).reshape(3)
+			color = tuple(int(value) for value in marker.get("color_bgr", (255, 255, 255)))
+			label = str(marker.get("label", "pose"))
+			self._draw_cube(position, 7.0, color)
+			self._label(label, position + np.array([8.0, 8.0, 8.0], dtype=np.float64), color)
+
 	def _draw_flight_path(self, flight_path_points):
 		if not flight_path_points:
 			return
@@ -769,6 +802,7 @@ class OpenGLScene3DVisualizer:
 		camera_pose: CameraWorldPose | None = None,
 		camera_local_detection_cm=None,
 		flight_path_points=None,
+		pose_markers=None,
 	):
 		for event in self._pygame.event.get():
 			if event.type == self._pygame.QUIT:
@@ -784,6 +818,7 @@ class OpenGLScene3DVisualizer:
 			for obstacle in scene_map.obstacles.values():
 				self._draw_shape(obstacle, active=active_obstacle is not None and obstacle.id == active_obstacle.id)
 		self._draw_flight_path(flight_path_points)
+		self._draw_pose_markers(pose_markers)
 		self._draw_camera_pose(camera_pose)
 		self._draw_camera_local_detection(camera_local_detection_cm)
 		self._pygame.display.flip()

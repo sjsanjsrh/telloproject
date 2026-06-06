@@ -33,11 +33,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from camera_calibration.camera_tranceform import load_camera_params
 from telloController import TelloController
-from yolo_seg.flight_plan import flight_plan_points, load_flight_plan
+from yolo_seg.flight_plan import flight_plan_points, load_flight_plan, nearest_path_point
 from yolo_seg.pnp_pos_est import SquarePoseDetection, YoloSquarePoseEstimator
 from yolo_seg.scene_map import Obstacle, SceneMap, load_scene_map
 from yolo_seg.scene_3d_viz import create_scene_3d_visualizer
-from yolo_seg.world_pose import estimate_camera_world_pose
+from yolo_seg.world_pose import CameraWorldPose, estimate_camera_world_pose
 
 
 DEFAULT_MODEL = "yolo_seg/res/runs/segment/train/weights/best.pt"
@@ -172,6 +172,61 @@ def estimate_camera_fov_deg(camera_matrix: np.ndarray) -> tuple[float, float]:
 	return hfov_deg, vfov_deg
 
 
+def blend_camera_pose(previous: Optional[CameraWorldPose], measurement: CameraWorldPose, alpha: float = 0.25) -> CameraWorldPose:
+	if previous is None:
+		return measurement
+	prev_position = np.asarray(previous.position_cm, dtype=np.float64).reshape(3)
+	measured_position = np.asarray(measurement.position_cm, dtype=np.float64).reshape(3)
+	position = prev_position * (1.0 - alpha) + measured_position * alpha
+	return CameraWorldPose(
+		position_cm=tuple(float(value) for value in position),
+		rotation_matrix=measurement.rotation_matrix,
+		method=f"filtered_{measurement.method}",
+	)
+
+
+def detection_blend_alpha(detection: Optional[SquarePoseDetection]) -> float:
+	if detection is None:
+		return 0.0
+	base_alpha = 0.06 if detection.pose_method == "outline_thickness" else 0.22
+	confidence_alpha = 0.34 * min(1.0, max(0.0, detection.pose_confidence))
+	return float(min(0.45, base_alpha + confidence_alpha))
+
+
+def build_pose_markers(
+	vision_pose: Optional[CameraWorldPose],
+	slam_pose: Optional[CameraWorldPose],
+	path_projection: Optional[dict],
+	pose_confidence: float = 0.0,
+) -> list[dict]:
+	markers: list[dict] = []
+	if path_projection is not None:
+		markers.append(
+			{
+				"label": f"path {path_projection['distance_cm']:.0f}cm",
+				"position_cm": path_projection["position_cm"],
+				"color_bgr": (255, 220, 80),
+			}
+		)
+	if slam_pose is not None:
+		markers.append(
+			{
+				"label": "slam",
+				"position_cm": slam_pose.position_cm,
+				"color_bgr": (255, 180, 60),
+			}
+		)
+	if vision_pose is not None:
+		markers.append(
+			{
+				"label": f"vision {pose_confidence:.2f}",
+				"position_cm": vision_pose.position_cm,
+				"color_bgr": (0, 255, 120),
+			}
+		)
+	return markers
+
+
 def load_optional_scene_map(path: Optional[str]) -> Optional[SceneMap]:
 	if not path:
 		return None
@@ -287,7 +342,7 @@ def add_detection_info(frame: np.ndarray, detection: Optional[SquarePoseDetectio
 	cv2.polylines(output, [corners], True, (0, 255, 0), 2)
 	cv2.circle(output, center, 4, (0, 0, 255), -1)
 
-	label = f"{detection.pose_method} score={detection.score:.1f} area={detection.area_px:.0f}px conf={detection.confidence:.2f}"
+	label = f"{detection.pose_method} pose={detection.pose_confidence:.2f} area={detection.area_px:.0f}px conf={detection.confidence:.2f}"
 	if detection.class_name:
 		label = f"{detection.class_name} {label}"
 	cv2.putText(output, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
@@ -432,7 +487,7 @@ def build_horizontal_dashboard(
 			f"inference: {inference_ms:.1f} ms",
 			f"post: {postprocess_ms:.1f} ms",
 			f"fps: {fps:.1f}",
-			f"score: {detection.score:.1f}   conf: {detection.confidence:.2f}",
+			f"score: {detection.score:.1f}   conf: {detection.confidence:.2f}   pose: {detection.pose_confidence:.2f}",
 			f"range px: {outer_w:.1f} x {outer_h:.1f}",
 			f"center px: ({detection.center_px[0]:.1f}, {detection.center_px[1]:.1f})",
 			thickness_text,
@@ -504,6 +559,8 @@ def main() -> None:
 	last_postprocess_ms = 0.0
 	last_camera_world_pose = None
 	last_camera_local_detection_cm = None
+	slam_pose = None
+	path_projection = None
 
 	try:
 		while True:
@@ -537,9 +594,9 @@ def main() -> None:
 				)
 			if camera_world_pose is not None:
 				last_camera_world_pose = camera_world_pose
-			if detection is not None and detection.position_tello_cm is not None:
-				last_camera_local_detection_cm = detection.position_tello_cm
-			elif detection is not None and detection.position_cm is not None:
+				slam_pose = blend_camera_pose(slam_pose, camera_world_pose, alpha=detection_blend_alpha(detection))
+				path_projection = nearest_path_point(flight_path_points, camera_world_pose.position_cm)
+			if detection is not None and detection.position_cm is not None:
 				last_camera_local_detection_cm = detection.position_cm
 			dashboard = build_horizontal_dashboard(
 				frame=frame,
@@ -567,16 +624,23 @@ def main() -> None:
 
 			cv2.imshow(args.window_name, dashboard)
 			if scene_3d is not None:
+				visible_camera_pose = camera_world_pose if camera_world_pose is not None else last_camera_world_pose
 				scene_3d.show(
 					scene_map,
 					active_obstacle=detection_obstacle,
-					camera_pose=camera_world_pose if camera_world_pose is not None else last_camera_world_pose,
+					camera_pose=visible_camera_pose,
 					camera_local_detection_cm=(
-						detection.position_tello_cm
-						if detection is not None and detection.position_tello_cm is not None
+						detection.position_cm
+						if detection is not None and detection.position_cm is not None
 						else last_camera_local_detection_cm
 					),
 					flight_path_points=flight_path_points,
+					pose_markers=build_pose_markers(
+						visible_camera_pose,
+						slam_pose,
+						path_projection,
+						pose_confidence=detection.pose_confidence if detection is not None else 0.0,
+					),
 				)
 			key = cv2.waitKey(1) & 0xFF
 			if scene_3d is not None and hasattr(scene_3d, "handle_key"):
