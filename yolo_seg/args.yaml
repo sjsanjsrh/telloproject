@@ -48,11 +48,11 @@ line_width: null # plot line width
 # Optimization / Loss
 overlap_mask: true # allow overlapping masks
 mask_ratio: 4 # mask downsample ratio
-dropout: 0.0 # dropout rate
-lr0: 0.01 # initial learning rate
+dropout: 0.02 # dropout rate
+lr0: 0.005 # initial learning rate
 lrf: 0.01 # final LR factor
 momentum: 0.937 # momentum
-weight_decay: 0.0005 # weight decay
+weight_decay: 0.0007 # weight decay
 warmup_epochs: 3.0 # warmup epochs
 warmup_momentum: 0.8 # warmup momentum
 warmup_bias_lr: 0.1 # warmup bias LR
@@ -68,8 +68,8 @@ nbs: 64 # nominal batch size
 
 # Augmentation
 hsv_h: 0.015 # hue augmentation
-hsv_s: 1.0 # saturation augmentation
-hsv_v: 0.5 # value augmentation
+hsv_s: 0.8 # saturation augmentation
+hsv_v: 0.4 # value augmentation
 degrees: 0.0 # rotation augmentation
 translate: 0.0 # translation augmentation
 scale: 0.0 # scale augmentation
