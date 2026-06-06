@@ -1,0 +1,87 @@
+# Training
+epochs: 600 # train epochs
+time: null # time limit, null uses epochs
+patience: 100 # early stopping patience
+batch: 64 # batch size
+imgsz: 480 # input image size
+cache: ram # dataset cache mode
+device: '0' # train device
+workers: 8 # dataloader workers
+name: train # run name under project
+exist_ok: false # overwrite same run name
+pretrained: true # use pretrained weights
+optimizer: auto # optimizer
+verbose: true # verbose logs
+seed: 0 # random seed
+deterministic: true # deterministic mode
+single_cls: false # merge all classes
+rect: false # rectangular training
+cos_lr: true # cosine LR schedule
+close_mosaic: 10 # disable mosaic for last N epochs
+resume: false # resume training
+amp: true # mixed precision
+fraction: 1.0 # dataset fraction
+profile: false # profile speed
+freeze: null # freeze layers
+multi_scale: 0.0 # multi-scale training
+compile: false # torch compile
+
+# Validation
+val: true # run validation
+split: val # validation split
+save_json: false # save COCO json results
+conf: 0.1 # confidence threshold
+iou: 0.7 # NMS IoU threshold
+max_det: 10 # max detections per image
+half: false # half precision eval
+dnn: false # OpenCV DNN backend
+plots: true # save plots
+augment: false # validation augmentation
+agnostic_nms: false # class-agnostic NMS
+classes: null # class filter
+retina_masks: false # high-resolution masks
+show_labels: true # draw labels on plots
+show_conf: true # draw confidence on plots
+show_boxes: true # draw boxes on plots
+line_width: null # plot line width
+
+# Optimization / Loss
+overlap_mask: true # allow overlapping masks
+mask_ratio: 4 # mask downsample ratio
+dropout: 0.02 # dropout rate
+lr0: 0.005 # initial learning rate
+lrf: 0.01 # final LR factor
+momentum: 0.937 # momentum
+weight_decay: 0.0007 # weight decay
+warmup_epochs: 3.0 # warmup epochs
+warmup_momentum: 0.8 # warmup momentum
+warmup_bias_lr: 0.1 # warmup bias LR
+box: 7.5 # box loss weight
+cls: 0.5 # class loss weight
+cls_pw: 0.0 # class positive weight
+dfl: 1.5 # DFL loss weight
+pose: 12.0 # pose loss weight
+kobj: 1.0 # keypoint obj loss weight
+rle: 1.0 # RLE related weight
+angle: 1.0 # angle loss weight
+nbs: 64 # nominal batch size
+
+# Augmentation
+hsv_h: 0.015 # hue augmentation
+hsv_s: 0.8 # saturation augmentation
+hsv_v: 0.4 # value augmentation
+degrees: 0.0 # rotation augmentation
+translate: 0.0 # translation augmentation
+scale: 0.0 # scale augmentation
+shear: 0.0 # shear augmentation
+perspective: 0.0 # perspective augmentation
+flipud: 0.0 # vertical flip probability
+fliplr: 0.5 # horizontal flip probability
+bgr: 0.0 # BGR channel swap probability
+mosaic: 0.0 # mosaic probability
+mixup: 0.0 # mixup probability
+cutmix: 0.0 # cutmix probability
+copy_paste: 0.0 # copy-paste probability
+copy_paste_mode: mixup # copy-paste mode
+auto_augment: randaugment # auto augmentation policy
+erasing: 0.2 # random erasing
