@@ -16,7 +16,7 @@ seed: 0 # random seed
 deterministic: true # deterministic mode
 single_cls: false # merge all classes
 rect: false # rectangular training
-cos_lr: false # cosine LR schedule
+cos_lr: true # cosine LR schedule
 close_mosaic: 10 # disable mosaic for last N epochs
 resume: false # resume training
 amp: true # mixed precision
@@ -30,9 +30,9 @@ compile: false # torch compile
 val: true # run validation
 split: val # validation split
 save_json: false # save COCO json results
-conf: null # confidence threshold
+conf: 0.1 # confidence threshold
 iou: 0.7 # NMS IoU threshold
-max_det: 300 # max detections per image
+max_det: 10 # max detections per image
 half: false # half precision eval
 dnn: false # OpenCV DNN backend
 plots: true # save plots
