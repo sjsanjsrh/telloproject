@@ -181,6 +181,10 @@ def load_optional_scene_map(path: Optional[str]) -> Optional[SceneMap]:
 def first_obstacle(scene_map: Optional[SceneMap]) -> Optional[Obstacle]:
 	if scene_map is None or not scene_map.obstacles:
 		return None
+	skip_types = {"start_area", "start_rectangle", "landing_point", "landing_zone", "landing_marker", "circle_pillar"}
+	for obstacle in scene_map.obstacles.values():
+		if obstacle.shape.type.lower() not in skip_types:
+			return obstacle
 	return next(iter(scene_map.obstacles.values()))
 
 

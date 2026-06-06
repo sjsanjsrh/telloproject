@@ -105,6 +105,15 @@ class Scene3DVisualizer:
 	def _draw_line_3d(self, image: np.ndarray, point_a, point_b, color, thickness: int = 2):
 		cv2.line(image, self._project(point_a), self._project(point_b), color, thickness, cv2.LINE_AA)
 
+	def _obstacle_color(self, obstacle: Obstacle, active: bool) -> tuple[int, int, int]:
+		if obstacle.color_bgr is not None:
+			return obstacle.color_bgr
+		return (40, 210, 255) if active else (140, 180, 210)
+
+	def _ground_center(self, obstacle: Obstacle) -> np.ndarray:
+		center = np.asarray(obstacle.position_cm, dtype=np.float64).reshape(3)
+		return np.array([center[0], center[1], center[2]], dtype=np.float64)
+
 	def _camera_angles(self, camera_pose: CameraWorldPose) -> tuple[float, float, float]:
 		rotation = np.asarray(camera_pose.rotation_matrix, dtype=np.float64).reshape(3, 3)
 		forward = rotation @ np.array([1.0, 0.0, 0.0], dtype=np.float64)
@@ -144,14 +153,71 @@ class Scene3DVisualizer:
 		center = np.asarray(obstacle.position_cm, dtype=np.float64).reshape(3)
 		return (rotation @ local.T).T + center
 
-	def _draw_obstacle(self, image: np.ndarray, obstacle: Obstacle, active: bool):
-		corners = self._obstacle_corners(obstacle)
-		color = (40, 210, 255) if active else (140, 180, 210)
+	def _ground_rectangle_corners(self, obstacle: Obstacle) -> np.ndarray:
+		half_width = obstacle.shape.width_cm / 2.0
+		half_height = obstacle.shape.height_cm / 2.0
+		local = np.array(
+			[
+				[-half_width, -half_height, 0.0],
+				[half_width, -half_height, 0.0],
+				[half_width, half_height, 0.0],
+				[-half_width, half_height, 0.0],
+			],
+			dtype=np.float64,
+		)
+		rotation = yaw_rotation_matrix_z(obstacle.yaw_deg)
+		center = self._ground_center(obstacle)
+		return (rotation @ local.T).T + center
+
+	def _draw_ground_loop(self, image: np.ndarray, center: np.ndarray, radius_x: float, radius_y: float, color, thickness: int = 2, points: int = 48):
+		angles = np.linspace(0.0, 2.0 * np.pi, points, endpoint=True)
+		loop = [
+			center + np.array([math.cos(angle) * radius_x, math.sin(angle) * radius_y, 0.0], dtype=np.float64)
+			for angle in angles
+		]
+		for index in range(len(loop) - 1):
+			self._draw_line_3d(image, loop[index], loop[index + 1], color, thickness)
+
+	def _draw_start_area(self, image: np.ndarray, obstacle: Obstacle, active: bool):
+		color = self._obstacle_color(obstacle, active)
+		corners = self._ground_rectangle_corners(obstacle)
 		thickness = 3 if active else 2
-		self._draw_column(image, obstacle, color)
 		for index in range(4):
 			self._draw_line_3d(image, corners[index], corners[(index + 1) % 4], color, thickness)
+		center = self._ground_center(obstacle)
+		cv2.circle(image, self._project(center), 4, color, -1, cv2.LINE_AA)
+		self._draw_column(image, obstacle, color, base_z=float(center[2]), height_cm=0.0)
 
+	def _draw_landing_marker(self, image: np.ndarray, obstacle: Obstacle, active: bool):
+		color = self._obstacle_color(obstacle, active)
+		center = self._ground_center(obstacle)
+		diameter = float(obstacle.shape.diameter_cm or max(obstacle.shape.width_cm, obstacle.shape.height_cm))
+		self._draw_ground_loop(image, center, diameter / 2.0, diameter / 2.0, color, thickness=3 if active else 2)
+		pillar_height = obstacle.shape.pillar_height_cm
+		if pillar_height is None:
+			pillar_height = max(10.0, obstacle.shape.thickness_cm * 10.0 if obstacle.shape.thickness_cm > 0.0 else 20.0)
+		pillar_radius = obstacle.shape.pillar_diameter_cm or max(4.0, diameter * 0.07)
+		base = center
+		top = center + np.array([0.0, 0.0, pillar_height], dtype=np.float64)
+		self._draw_line_3d(image, base, top, color, 3 if active else 2)
+		self._draw_ground_loop(image, base, pillar_radius * 0.5, pillar_radius * 0.5, color, thickness=2)
+		cv2.circle(image, self._project(top), 4, color, -1, cv2.LINE_AA)
+
+	def _draw_shape(self, image: np.ndarray, obstacle: Obstacle, active: bool):
+		shape_type = obstacle.shape.type.lower()
+		if shape_type in {"start_area", "start_rectangle"}:
+			self._draw_start_area(image, obstacle, active)
+			return
+		if shape_type in {"landing_point", "landing_zone", "landing_marker", "circle_pillar"}:
+			self._draw_landing_marker(image, obstacle, active)
+			return
+
+		color = self._obstacle_color(obstacle, active)
+		corners = self._obstacle_corners(obstacle)
+		thickness = 3 if active else 2
+		self._draw_column(image, obstacle, color, base_z=0.0)
+		for index in range(4):
+			self._draw_line_3d(image, corners[index], corners[(index + 1) % 4], color, thickness)
 		center_2d = self._project(obstacle.position_cm)
 		cv2.circle(image, center_2d, 4, color, -1, cv2.LINE_AA)
 		cv2.putText(
@@ -165,21 +231,23 @@ class Scene3DVisualizer:
 			cv2.LINE_AA,
 		)
 
-	def _draw_column(self, image: np.ndarray, obstacle: Obstacle, color):
+	def _draw_column(self, image: np.ndarray, obstacle: Obstacle, color, base_z: float = 0.0, height_cm: float | None = None):
 		center = np.asarray(obstacle.position_cm, dtype=np.float64).reshape(3)
-		base = np.array([center[0], center[1], 0.0], dtype=np.float64)
-		self._draw_line_3d(image, base, center, (90, 90, 90), 2)
+		base = np.array([center[0], center[1], base_z], dtype=np.float64)
+		top = center if height_cm is None else np.array([center[0], center[1], base_z + height_cm], dtype=np.float64)
+		self._draw_line_3d(image, base, top, (90, 90, 90), 2)
 		cv2.circle(image, self._project(base), 4, (90, 90, 90), -1, cv2.LINE_AA)
-		cv2.putText(
-			image,
-			f"{center[2]:.0f}cm",
-			(self._project(center)[0] + 8, self._project(center)[1] + 14),
-			cv2.FONT_HERSHEY_SIMPLEX,
-			0.45,
-			color,
-			1,
-			cv2.LINE_AA,
-		)
+		if height_cm is None:
+			cv2.putText(
+				image,
+				f"{center[2]:.0f}cm",
+				(self._project(center)[0] + 8, self._project(center)[1] + 14),
+				cv2.FONT_HERSHEY_SIMPLEX,
+				0.45,
+				color,
+				1,
+				cv2.LINE_AA,
+			)
 
 	def _draw_camera_pose(self, image: np.ndarray, camera_pose: CameraWorldPose | None):
 		if camera_pose is None:
@@ -274,7 +342,7 @@ class Scene3DVisualizer:
 
 		if scene_map is not None:
 			for obstacle in scene_map.obstacles.values():
-				self._draw_obstacle(image, obstacle, active=active_obstacle is not None and obstacle.id == active_obstacle.id)
+				self._draw_shape(image, obstacle, active=active_obstacle is not None and obstacle.id == active_obstacle.id)
 
 		self._draw_camera_pose(image, camera_pose)
 		self._draw_camera_local_detection(image, camera_local_detection_cm)
@@ -437,10 +505,80 @@ class OpenGLScene3DVisualizer:
 		center = np.asarray(obstacle.position_cm, dtype=np.float64).reshape(3)
 		return (rotation @ local.T).T + center
 
-	def _draw_obstacle(self, obstacle: Obstacle, active: bool):
+	def _obstacle_color(self, obstacle: Obstacle, active: bool) -> tuple[int, int, int]:
+		if obstacle.color_bgr is not None:
+			return obstacle.color_bgr
+		return (40, 210, 255) if active else (140, 180, 210)
+
+	def _ground_center(self, obstacle: Obstacle) -> np.ndarray:
+		return np.asarray(obstacle.position_cm, dtype=np.float64).reshape(3)
+
+	def _ground_rectangle_corners(self, obstacle: Obstacle) -> np.ndarray:
+		half_width = obstacle.shape.width_cm / 2.0
+		half_height = obstacle.shape.height_cm / 2.0
+		local = np.array(
+			[
+				[-half_width, -half_height, 0.0],
+				[half_width, -half_height, 0.0],
+				[half_width, half_height, 0.0],
+				[-half_width, half_height, 0.0],
+			],
+			dtype=np.float64,
+		)
+		rotation = yaw_rotation_matrix_z(obstacle.yaw_deg)
+		center = self._ground_center(obstacle)
+		return (rotation @ local.T).T + center
+
+	def _draw_ground_loop(self, center: np.ndarray, radius_x: float, radius_y: float, color, width: float = 2.0, points: int = 48):
+		angles = np.linspace(0.0, 2.0 * np.pi, points, endpoint=True)
+		loop = [
+			center + np.array([math.cos(angle) * radius_x, math.sin(angle) * radius_y, 0.0], dtype=np.float64)
+			for angle in angles
+		]
+		self._color(color)
+		self._gl.glLineWidth(float(width))
+		self._gl.glBegin(GL_LINE_LOOP)
+		for point in loop:
+			self._vertex(point)
+		self._gl.glEnd()
+
+	def _draw_start_area(self, obstacle: Obstacle, active: bool):
+		color = self._obstacle_color(obstacle, active)
+		corners = self._ground_rectangle_corners(obstacle)
+		self._color(color)
+		self._gl.glLineWidth(3.0 if active else 2.0)
+		self._gl.glBegin(GL_LINE_LOOP)
+		for corner in corners:
+			self._vertex(corner)
+		self._gl.glEnd()
+		center = self._ground_center(obstacle)
+		self._draw_cube(center, 3.5, color)
+
+	def _draw_landing_marker(self, obstacle: Obstacle, active: bool):
+		color = self._obstacle_color(obstacle, active)
+		center = self._ground_center(obstacle)
+		diameter = float(obstacle.shape.diameter_cm or max(obstacle.shape.width_cm, obstacle.shape.height_cm))
+		self._draw_ground_loop(center, diameter / 2.0, diameter / 2.0, color, width=3.0 if active else 2.0)
+		pillar_height = obstacle.shape.pillar_height_cm
+		if pillar_height is None:
+			pillar_height = max(10.0, obstacle.shape.thickness_cm * 10.0 if obstacle.shape.thickness_cm > 0.0 else 20.0)
+		top = center + np.array([0.0, 0.0, pillar_height], dtype=np.float64)
+		self._line(center, top, color, 3.0 if active else 2.0)
+		self._draw_cube(top, 3.5, color)
+		self._draw_ground_loop(center, (obstacle.shape.pillar_diameter_cm or max(4.0, diameter * 0.07)) * 0.5, (obstacle.shape.pillar_diameter_cm or max(4.0, diameter * 0.07)) * 0.5, color, width=1.5)
+
+	def _draw_shape(self, obstacle: Obstacle, active: bool):
+		shape_type = obstacle.shape.type.lower()
+		if shape_type in {"start_area", "start_rectangle"}:
+			self._draw_start_area(obstacle, active)
+			return
+		if shape_type in {"landing_point", "landing_zone", "landing_marker", "circle_pillar"}:
+			self._draw_landing_marker(obstacle, active)
+			return
+
 		gl = self._gl
 		corners = self._obstacle_corners(obstacle)
-		color = (40, 210, 255) if active else (140, 180, 210)
+		color = self._obstacle_color(obstacle, active)
 		self._draw_column(obstacle, color)
 		self._color(color)
 		gl.glLineWidth(4.0 if active else 2.0)
@@ -586,7 +724,7 @@ class OpenGLScene3DVisualizer:
 		self._draw_grid()
 		if scene_map is not None:
 			for obstacle in scene_map.obstacles.values():
-				self._draw_obstacle(obstacle, active=active_obstacle is not None and obstacle.id == active_obstacle.id)
+				self._draw_shape(obstacle, active=active_obstacle is not None and obstacle.id == active_obstacle.id)
 		self._draw_camera_pose(camera_pose)
 		self._draw_camera_local_detection(camera_local_detection_cm)
 		self._pygame.display.flip()

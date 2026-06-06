@@ -35,3 +35,27 @@ obstacles:
         width: 80
         height: 75
       thickness_cm: 3
+
+
+  - id: START
+    class_name: START
+    position_cm: [-30, 0, 0]
+    yaw_deg: 0
+    color_bgr: [200, 200, 200]
+    shape:
+      type: start_area
+      size_cm:
+        width: 60
+        height: 60
+
+  - id: LANDING
+    class_name: LANDING
+    position_cm: [200, 225, 0]
+    yaw_deg: 0
+    color_bgr: [80, 80, 255]
+    shape:
+      type: landing_zone
+      size_cm:
+        diameter: 50
+        pillar_diameter: 20
+        pillar_height: 20
