@@ -37,6 +37,7 @@ from yolo_seg.flight_plan import flight_plan_points, load_flight_plan, nearest_p
 from yolo_seg.pnp_pos_est import SquarePoseDetection, YoloSquarePoseEstimator
 from yolo_seg.scene_map import Obstacle, SceneMap, load_scene_map
 from yolo_seg.scene_3d_viz import create_scene_3d_visualizer
+from yolo_seg.slam_backend import SlamPose, create_slam_backend
 from yolo_seg.world_pose import CameraWorldPose, estimate_camera_world_pose
 
 
@@ -78,6 +79,14 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--window-name", default="pnp_pos_est_horizontal", help="OpenCV window name")
 	parser.add_argument("--no-3d", action="store_true", help="Disable the separate 3D scene window")
 	parser.add_argument("--3d-renderer", dest="scene_3d_renderer", default="gpu", choices=("gpu", "cpu"), help="3D scene renderer backend")
+	parser.add_argument("--slam-backend", default="none", choices=("none", "file", "orbslam3"), help="External SLAM pose source")
+	parser.add_argument("--slam-pose-file", default=None, help="JSON/JSONL pose file written by SLAM")
+	parser.add_argument("--slam-scale-cm", type=float, default=100.0, help="Scale for SLAM position records without position_cm, e.g. meters to cm")
+	parser.add_argument("--orbslam3-exe", default=None, help="ORB-SLAM3 live wrapper executable")
+	parser.add_argument("--orbslam3-vocab", default=None, help="ORB-SLAM3 vocabulary file, usually ORBvoc.txt")
+	parser.add_argument("--orbslam3-settings", default=None, help="ORB-SLAM3 camera/settings YAML")
+	parser.add_argument("--orbslam3-mode", default="mono", choices=("mono", "mono_inertial", "stereo", "rgbd"), help="ORB-SLAM3 tracking mode")
+	parser.add_argument("--orbslam3-source", default="tello", help="Source argument passed to the ORB-SLAM3 live wrapper")
 	return parser.parse_args()
 
 
@@ -172,30 +181,9 @@ def estimate_camera_fov_deg(camera_matrix: np.ndarray) -> tuple[float, float]:
 	return hfov_deg, vfov_deg
 
 
-def blend_camera_pose(previous: Optional[CameraWorldPose], measurement: CameraWorldPose, alpha: float = 0.25) -> CameraWorldPose:
-	if previous is None:
-		return measurement
-	prev_position = np.asarray(previous.position_cm, dtype=np.float64).reshape(3)
-	measured_position = np.asarray(measurement.position_cm, dtype=np.float64).reshape(3)
-	position = prev_position * (1.0 - alpha) + measured_position * alpha
-	return CameraWorldPose(
-		position_cm=tuple(float(value) for value in position),
-		rotation_matrix=measurement.rotation_matrix,
-		method=f"filtered_{measurement.method}",
-	)
-
-
-def detection_blend_alpha(detection: Optional[SquarePoseDetection]) -> float:
-	if detection is None:
-		return 0.0
-	base_alpha = 0.06 if detection.pose_method == "outline_thickness" else 0.22
-	confidence_alpha = 0.34 * min(1.0, max(0.0, detection.pose_confidence))
-	return float(min(0.45, base_alpha + confidence_alpha))
-
-
 def build_pose_markers(
 	vision_pose: Optional[CameraWorldPose],
-	slam_pose: Optional[CameraWorldPose],
+	slam_pose: Optional[SlamPose],
 	path_projection: Optional[dict],
 	pose_confidence: float = 0.0,
 ) -> list[dict]:
@@ -211,7 +199,7 @@ def build_pose_markers(
 	if slam_pose is not None:
 		markers.append(
 			{
-				"label": "slam",
+				"label": f"orb {slam_pose.tracking_state}",
 				"position_cm": slam_pose.position_cm,
 				"color_bgr": (255, 180, 60),
 			}
@@ -549,6 +537,7 @@ def main() -> None:
 
 	model, inference_device = _resolve_inference_model(args.model, args.device, args.imgsz)
 	capture = open_capture(source, args.camera_direction, args.video_resolution)
+	slam_backend = create_slam_backend(args)
 	camera_fov_deg = estimate_camera_fov_deg(camera_matrix)
 	scene_3d = (
 		create_scene_3d_visualizer(prefer_gpu=args.scene_3d_renderer == "gpu", camera_fov_deg=camera_fov_deg)
@@ -563,6 +552,7 @@ def main() -> None:
 	path_projection = None
 
 	try:
+		slam_backend.start()
 		while True:
 			frame_start = perf_counter()
 			read_start = perf_counter()
@@ -577,6 +567,10 @@ def main() -> None:
 			result = results[0] if results else None
 
 			postprocess_start = perf_counter()
+			new_slam_pose = slam_backend.poll()
+			if new_slam_pose is not None:
+				slam_pose = new_slam_pose
+				path_projection = nearest_path_point(flight_path_points, slam_pose.position_cm)
 			detection = estimator.estimate_from_result(result) if result is not None else None
 			detection_obstacle = resolve_obstacle(scene_map, args.object_id, detection)
 			reference_obstacle = detection_obstacle or config_obstacle
@@ -594,8 +588,8 @@ def main() -> None:
 				)
 			if camera_world_pose is not None:
 				last_camera_world_pose = camera_world_pose
-				slam_pose = blend_camera_pose(slam_pose, camera_world_pose, alpha=detection_blend_alpha(detection))
-				path_projection = nearest_path_point(flight_path_points, camera_world_pose.position_cm)
+				if slam_pose is None:
+					path_projection = nearest_path_point(flight_path_points, camera_world_pose.position_cm)
 			if detection is not None and detection.position_cm is not None:
 				last_camera_local_detection_cm = detection.position_cm
 			dashboard = build_horizontal_dashboard(
@@ -624,7 +618,11 @@ def main() -> None:
 
 			cv2.imshow(args.window_name, dashboard)
 			if scene_3d is not None:
-				visible_camera_pose = camera_world_pose if camera_world_pose is not None else last_camera_world_pose
+				visible_camera_pose = (
+					slam_pose.camera_world_pose
+					if slam_pose is not None
+					else camera_world_pose if camera_world_pose is not None else last_camera_world_pose
+				)
 				scene_3d.show(
 					scene_map,
 					active_obstacle=detection_obstacle,
@@ -649,6 +647,7 @@ def main() -> None:
 				break
 	finally:
 		capture.release()
+		slam_backend.close()
 		cv2.destroyAllWindows()
 
 
