@@ -79,14 +79,16 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--window-name", default="pnp_pos_est_horizontal", help="OpenCV window name")
 	parser.add_argument("--no-3d", action="store_true", help="Disable the separate 3D scene window")
 	parser.add_argument("--3d-renderer", dest="scene_3d_renderer", default="gpu", choices=("gpu", "cpu"), help="3D scene renderer backend")
-	parser.add_argument("--slam-backend", default="none", choices=("none", "file", "orbslam3"), help="External SLAM pose source")
+	parser.add_argument("--slam-backend", default="none", choices=("none", "file", "orbslam3", "orbslam3_py"), help="External SLAM pose source")
 	parser.add_argument("--slam-pose-file", default=None, help="JSON/JSONL pose file written by SLAM")
 	parser.add_argument("--slam-scale-cm", type=float, default=100.0, help="Scale for SLAM position records without position_cm, e.g. meters to cm")
 	parser.add_argument("--orbslam3-exe", default=None, help="ORB-SLAM3 live wrapper executable")
-	parser.add_argument("--orbslam3-vocab", default=None, help="ORB-SLAM3 vocabulary file, usually ORBvoc.txt")
+	parser.add_argument("--orbslam3-vocab", default=None, help="ORB-SLAM3 vocabulary file, usually ORBvoc.bin")
 	parser.add_argument("--orbslam3-settings", default=None, help="ORB-SLAM3 camera/settings YAML")
 	parser.add_argument("--orbslam3-mode", default="mono", choices=("mono", "mono_inertial", "stereo", "rgbd"), help="ORB-SLAM3 tracking mode")
-	parser.add_argument("--orbslam3-source", default="tello", help="Source argument passed to the ORB-SLAM3 live wrapper")
+	parser.add_argument("--orbslam3-source", default="auto", help="Source argument passed to the ORB-SLAM3 live wrapper")
+	parser.add_argument("--orbslam3-relay-frame-file", default=None, help="Frame relay JPEG path used when Tello is the source")
+	parser.add_argument("--orbslam3-py-module", default=None, help="Path to orbslam3_py .pyd module for in-process SLAM")
 	return parser.parse_args()
 
 
@@ -186,6 +188,7 @@ def build_pose_markers(
 	slam_pose: Optional[SlamPose],
 	path_projection: Optional[dict],
 	pose_confidence: float = 0.0,
+	slam_status: Optional[str] = None,
 ) -> list[dict]:
 	markers: list[dict] = []
 	if path_projection is not None:
@@ -202,6 +205,14 @@ def build_pose_markers(
 				"label": f"orb {slam_pose.tracking_state}",
 				"position_cm": slam_pose.position_cm,
 				"color_bgr": (255, 180, 60),
+			}
+		)
+	elif slam_status and "off" not in slam_status:
+		markers.append(
+			{
+				"label": "orb WAIT",
+				"position_cm": (0.0, 0.0, 0.0),
+				"color_bgr": (80, 160, 255),
 			}
 		)
 	if vision_pose is not None:
@@ -434,6 +445,7 @@ def build_horizontal_dashboard(
 	fps: float,
 	object_position_cm: Optional[tuple[float, float, float]],
 	object_yaw_deg: float,
+	slam_status: Optional[str] = None,
 ) -> np.ndarray:
 	original_panel = resize_to_height(frame, panel_height)
 	plot_panel = resize_to_fit_height(build_outline_overlay(frame, result), panel_height) if result is not None else original_panel.copy()
@@ -482,6 +494,8 @@ def build_horizontal_dashboard(
 			position_text,
 			drone_position_text,
 		]
+	if slam_status:
+		status_lines.append(f"slam: {slam_status}")
 
 	image_strip = np.hstack([original_panel, plot_panel, pose_panel])
 	info_panel = make_text_panel(image_strip.shape[1], status_lines)
@@ -560,6 +574,8 @@ def main() -> None:
 			read_ms = (perf_counter() - read_start) * 1000.0
 			if not ok or frame is None:
 				break
+			if hasattr(slam_backend, "push_frame"):
+				slam_backend.push_frame(frame)
 
 			inference_start = perf_counter()
 			results = model.predict(frame, imgsz=args.imgsz, conf=args.conf, device=inference_device, verbose=False)
@@ -605,6 +621,7 @@ def main() -> None:
 				fps=fps_ema,
 				object_position_cm=dashboard_object_position_cm,
 				object_yaw_deg=dashboard_object_yaw_deg,
+				slam_status=slam_backend.status_text(),
 			)
 			last_postprocess_ms = (perf_counter() - postprocess_start) * 1000.0
 
@@ -638,6 +655,7 @@ def main() -> None:
 						slam_pose,
 						path_projection,
 						pose_confidence=detection.pose_confidence if detection is not None else 0.0,
+						slam_status=slam_backend.status_text(),
 					),
 				)
 			key = cv2.waitKey(1) & 0xFF
