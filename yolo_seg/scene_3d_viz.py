@@ -81,6 +81,15 @@ class Scene3DVisualizer:
 		self.pitch_deg = 28.0
 		self.camera_fov_deg = camera_fov_deg or (60.0, 45.0)
 		self.camera_frustum_length_cm = 220.0
+		self._mouse_callback_set = False
+
+	def _zoom(self, factor: float):
+		self.scale = float(np.clip(self.scale * factor, 0.45, 7.5))
+
+	def _on_mouse(self, event, _x, _y, flags, _param):
+		if event != cv2.EVENT_MOUSEWHEEL:
+			return
+		self._zoom(1.12 if flags > 0 else 1.0 / 1.12)
 
 	def _view_point(self, point_cm) -> np.ndarray:
 		point = np.asarray(point_cm, dtype=np.float64).reshape(3) - np.array([100.0, 80.0, 60.0], dtype=np.float64)
@@ -103,7 +112,7 @@ class Scene3DVisualizer:
 			dtype=np.float64,
 		)
 		view = pitch_matrix @ yaw_matrix @ point
-		return np.array([view[1], view[2], view[0]], dtype=np.float64)
+		return np.array([view[0], view[2], view[1]], dtype=np.float64)
 
 	def _project(self, point_cm) -> tuple[int, int]:
 		x, y, _z = self._view_point(point_cm)
@@ -247,16 +256,7 @@ class Scene3DVisualizer:
 		self._draw_line_3d(image, base, top, (90, 90, 90), 2)
 		cv2.circle(image, self._project(base), 4, (90, 90, 90), -1, cv2.LINE_AA)
 		if height_cm is None:
-			cv2.putText(
-				image,
-				f"{center[2]:.0f}cm",
-				(self._project(center)[0] + 8, self._project(center)[1] + 14),
-				cv2.FONT_HERSHEY_SIMPLEX,
-				0.45,
-				color,
-				1,
-				cv2.LINE_AA,
-			)
+			return
 
 	def _draw_camera_pose(self, image: np.ndarray, camera_pose: CameraWorldPose | None):
 		if camera_pose is None:
@@ -267,23 +267,12 @@ class Scene3DVisualizer:
 		cv2.circle(image, center_2d, 7, (0, 255, 120), -1, cv2.LINE_AA)
 		cv2.putText(
 			image,
-			f"drone ({position[0]:.0f},{position[1]:.0f},{position[2]:.0f})",
+			"drone",
 			(center_2d[0] + 10, center_2d[1] - 10),
 			cv2.FONT_HERSHEY_SIMPLEX,
 			0.52,
 			(0, 255, 120),
 			2,
-			cv2.LINE_AA,
-		)
-		yaw_deg, pitch_deg, roll_deg = self._camera_angles(camera_pose)
-		cv2.putText(
-			image,
-			f"yaw {yaw_deg:.0f} pitch {pitch_deg:.0f} roll {roll_deg:.0f}",
-			(center_2d[0] + 10, center_2d[1] + 12),
-			cv2.FONT_HERSHEY_SIMPLEX,
-			0.48,
-			(0, 255, 120),
-			1,
 			cv2.LINE_AA,
 		)
 
@@ -329,7 +318,7 @@ class Scene3DVisualizer:
 		cv2.circle(image, point_2d, 6, (255, 80, 220), -1, cv2.LINE_AA)
 		cv2.putText(
 			image,
-			f"tello tvec ({position[0]:.0f},{position[1]:.0f},{position[2]:.0f})",
+			"target",
 			(point_2d[0] + 10, point_2d[1] + 18),
 			cv2.FONT_HERSHEY_SIMPLEX,
 			0.5,
@@ -406,7 +395,6 @@ class Scene3DVisualizer:
 		self._draw_pose_markers(image, pose_markers)
 		self._draw_camera_pose(image, camera_pose)
 		self._draw_camera_local_detection(image, camera_local_detection_cm)
-		cv2.putText(image, "3D scene map", (18, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (235, 235, 235), 2, cv2.LINE_AA)
 		return image
 
 	def show(
@@ -418,6 +406,10 @@ class Scene3DVisualizer:
 		flight_path_points=None,
 		pose_markers=None,
 	):
+		if not self._mouse_callback_set:
+			cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+			cv2.setMouseCallback(self.window_name, self._on_mouse)
+			self._mouse_callback_set = True
 		cv2.imshow(self.window_name, self.render(scene_map, active_obstacle, camera_pose, camera_local_detection_cm, flight_path_points, pose_markers))
 		return True
 
@@ -431,9 +423,9 @@ class Scene3DVisualizer:
 		elif key in (ord("s"), ord("S")):
 			self.pitch_deg -= 4.0
 		elif key in (ord("z"), ord("Z")):
-			self.scale = min(6.0, self.scale + 0.25)
+			self._zoom(1.12)
 		elif key in (ord("x"), ord("X")):
-			self.scale = max(0.5, self.scale - 0.25)
+			self._zoom(1.0 / 1.12)
 		elif key in (ord("r"), ord("R")):
 			self.yaw_deg = -35.0
 			self.pitch_deg = 28.0
@@ -458,6 +450,7 @@ class OpenGLScene3DVisualizer:
 		self.yaw_deg = -35.0
 		self.pitch_deg = 28.0
 		self.distance_cm = 520.0
+		self.view_size = 360.0 / max(0.1, self.scale)
 		self.camera_fov_deg = camera_fov_deg or (60.0, 45.0)
 		self.camera_frustum_length_cm = 220.0
 		self._pygame = pygame
@@ -509,11 +502,19 @@ class OpenGLScene3DVisualizer:
 		gl.glViewport(0, 0, self.width, self.height)
 		gl.glClearColor(0.08, 0.085, 0.095, 1.0)
 		gl.glEnable(GL_DEPTH_TEST)
+		self._set_projection()
+
+	def _set_projection(self):
+		gl = self._gl
 		gl.glMatrixMode(GL_PROJECTION)
 		gl.glLoadIdentity()
 		aspect = self.width / float(self.height)
-		view_size = 360.0
+		view_size = float(self.view_size)
 		gl.glOrtho(-view_size * aspect, view_size * aspect, -view_size, view_size, -1200.0, 1200.0)
+
+	def _zoom(self, factor: float):
+		self.view_size = float(np.clip(self.view_size / factor, 70.0, 780.0))
+		self._set_projection()
 
 	def _set_camera(self):
 		gl = self._gl
@@ -521,8 +522,8 @@ class OpenGLScene3DVisualizer:
 		gl.glLoadIdentity()
 		gl.glTranslated(0.0, 0.0, -self.distance_cm)
 		gl.glRotated(self.pitch_deg, 1.0, 0.0, 0.0)
-		gl.glRotated(self.yaw_deg, 0.0, 1.0, 0.0)
-		gl.glTranslated(-80.0, -60.0, 100.0)
+		gl.glRotated(self.yaw_deg, 0.0, 0.0, 1.0)
+		gl.glTranslated(-100.0, -80.0, -60.0)
 
 	def _color(self, bgr):
 		b, g, r = bgr
@@ -530,7 +531,7 @@ class OpenGLScene3DVisualizer:
 
 	def _vertex(self, point):
 		x, y, z = np.asarray(point, dtype=np.float64).reshape(3)
-		self._gl.glVertex3d(float(y), float(z), float(-x))
+		self._gl.glVertex3d(float(x), float(y), float(z))
 
 	def _line(self, point_a, point_b, color, width: float = 2.0):
 		gl = self._gl
@@ -674,7 +675,7 @@ class OpenGLScene3DVisualizer:
 		gl.glEnable(GL_BLEND)
 		gl.glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 		gl.glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
-		gl.glRasterPos3d(float(y), float(z), float(-x))
+		gl.glRasterPos3d(float(x), float(y), float(z))
 		gl.glDrawPixels(width, height, GL_RGBA, GL_UNSIGNED_BYTE, buffer)
 		gl.glDisable(GL_BLEND)
 		gl.glEnable(GL_DEPTH_TEST)
@@ -688,9 +689,7 @@ class OpenGLScene3DVisualizer:
 		self._line(position, position + camera_pose.rotation_matrix @ np.array([0.0, 0.0, 45.0]), (255, 120, 80), 4.0)
 		self._draw_cube(position, 8.0, (0, 255, 120))
 		self._line(position, position + camera_pose.rotation_matrix @ np.array([80.0, 0.0, 0.0]), (255, 255, 100), 4.0)
-		self._label(f"drone {position[0]:.0f},{position[1]:.0f},{position[2]:.0f}", position + np.array([10.0, 12.0, 0.0]), (0, 255, 120))
-		yaw_deg, pitch_deg, roll_deg = self._camera_angles(camera_pose)
-		self._label(f"yaw {yaw_deg:.0f} pitch {pitch_deg:.0f} roll {roll_deg:.0f}", position + np.array([10.0, 20.0, 0.0]), (0, 255, 120))
+		self._label("drone", position + np.array([10.0, 12.0, 0.0]), (0, 255, 120))
 		self._draw_camera_frustum(camera_pose)
 
 	def _camera_angles(self, camera_pose: CameraWorldPose) -> tuple[float, float, float]:
@@ -729,7 +728,7 @@ class OpenGLScene3DVisualizer:
 		position = opencv_to_tello_vector(detection_position_cm)
 		self._line((0, 0, 0), position, (255, 80, 220), 3.0)
 		self._draw_cube(position, 6.0, (255, 80, 220))
-		self._label(f"tello {position[0]:.0f},{position[1]:.0f},{position[2]:.0f}", position + np.array([8.0, 8.0, 0.0]), (255, 80, 220))
+		self._label("target", position + np.array([8.0, 8.0, 0.0]), (255, 80, 220))
 
 	def _draw_pose_markers(self, pose_markers):
 		if not pose_markers:
@@ -787,13 +786,15 @@ class OpenGLScene3DVisualizer:
 		elif key in (ord("s"), ord("S")):
 			self.pitch_deg -= 4.0
 		elif key in (ord("z"), ord("Z")):
-			self.distance_cm = max(160.0, self.distance_cm - 35.0)
+			self._zoom(1.12)
 		elif key in (ord("x"), ord("X")):
-			self.distance_cm += 35.0
+			self._zoom(1.0 / 1.12)
 		elif key in (ord("r"), ord("R")):
 			self.yaw_deg = -35.0
 			self.pitch_deg = 28.0
 			self.distance_cm = 520.0
+			self.view_size = 360.0 / max(0.1, self.scale)
+			self._set_projection()
 
 	def show(
 		self,
@@ -809,6 +810,8 @@ class OpenGLScene3DVisualizer:
 				return False
 			if event.type == self._pygame.KEYDOWN:
 				self.handle_key(event.key)
+			if event.type == self._pygame.MOUSEWHEEL:
+				self._zoom(1.12 if event.y > 0 else 1.0 / 1.12)
 
 		gl = self._gl
 		gl.glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)

@@ -79,15 +79,10 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--window-name", default="pnp_pos_est_horizontal", help="OpenCV window name")
 	parser.add_argument("--no-3d", action="store_true", help="Disable the separate 3D scene window")
 	parser.add_argument("--3d-renderer", dest="scene_3d_renderer", default="gpu", choices=("gpu", "cpu"), help="3D scene renderer backend")
-	parser.add_argument("--slam-backend", default="none", choices=("none", "file", "orbslam3", "orbslam3_py"), help="External SLAM pose source")
-	parser.add_argument("--slam-pose-file", default=None, help="JSON/JSONL pose file written by SLAM")
+	parser.add_argument("--slam-backend", default="none", choices=("none", "orbslam3_py"), help="SLAM pose source")
 	parser.add_argument("--slam-scale-cm", type=float, default=100.0, help="Scale for SLAM position records without position_cm, e.g. meters to cm")
-	parser.add_argument("--orbslam3-exe", default=None, help="ORB-SLAM3 live wrapper executable")
-	parser.add_argument("--orbslam3-vocab", default=None, help="ORB-SLAM3 vocabulary file, usually ORBvoc.bin")
+	parser.add_argument("--orbslam3-vocab", default=None, help="ORB-SLAM3 vocabulary file, usually ORBvoc.txt")
 	parser.add_argument("--orbslam3-settings", default=None, help="ORB-SLAM3 camera/settings YAML")
-	parser.add_argument("--orbslam3-mode", default="mono", choices=("mono", "mono_inertial", "stereo", "rgbd"), help="ORB-SLAM3 tracking mode")
-	parser.add_argument("--orbslam3-source", default="auto", help="Source argument passed to the ORB-SLAM3 live wrapper")
-	parser.add_argument("--orbslam3-relay-frame-file", default=None, help="Frame relay JPEG path used when Tello is the source")
 	parser.add_argument("--orbslam3-py-module", default=None, help="Path to orbslam3_py .pyd module for in-process SLAM")
 	return parser.parse_args()
 
@@ -194,7 +189,7 @@ def build_pose_markers(
 	if path_projection is not None:
 		markers.append(
 			{
-				"label": f"path {path_projection['distance_cm']:.0f}cm",
+				"label": "path",
 				"position_cm": path_projection["position_cm"],
 				"color_bgr": (255, 220, 80),
 			}
@@ -202,15 +197,22 @@ def build_pose_markers(
 	if slam_pose is not None:
 		markers.append(
 			{
-				"label": f"orb {slam_pose.tracking_state}",
+				"label": "orb",
 				"position_cm": slam_pose.position_cm,
 				"color_bgr": (255, 180, 60),
 			}
 		)
 	elif slam_status and "off" not in slam_status:
+		label = "orb WAIT"
+		if "inproc error:" in slam_status:
+			label = "orb ERR"
+		elif "inproc frames 0" in slam_status:
+			label = "orb INIT"
+		elif "inproc frames" in slam_status:
+			label = "orb"
 		markers.append(
 			{
-				"label": "orb WAIT",
+				"label": label,
 				"position_cm": (0.0, 0.0, 0.0),
 				"color_bgr": (80, 160, 255),
 			}
@@ -218,7 +220,7 @@ def build_pose_markers(
 	if vision_pose is not None:
 		markers.append(
 			{
-				"label": f"vision {pose_confidence:.2f}",
+				"label": "vision",
 				"position_cm": vision_pose.position_cm,
 				"color_bgr": (0, 255, 120),
 			}
@@ -290,10 +292,6 @@ class TelloStreamCapture:
 			self.tello.closseVideo()
 		except Exception:
 			pass
-		try:
-			self.tello.__del__()
-		except Exception:
-			pass
 
 
 def resize_to_width(image: np.ndarray, width: int) -> np.ndarray:
@@ -345,11 +343,6 @@ def add_detection_info(frame: np.ndarray, detection: Optional[SquarePoseDetectio
 	if detection.class_name:
 		label = f"{detection.class_name} {label}"
 	cv2.putText(output, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
-
-	if detection.position_tello_cm is not None:
-		x, y, z = detection.position_tello_cm
-		pose_label = f"tello=({x:.1f}, {y:.1f}, {z:.1f}) cm"
-		cv2.putText(output, pose_label, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
 
 	return output
 
@@ -455,44 +448,17 @@ def build_horizontal_dashboard(
 		status_lines = [
 			f"model: {model_name}",
 			"status: no valid square detection",
-			f"read: {read_ms:.1f} ms",
 			f"inference: {inference_ms:.1f} ms",
-			f"post: {postprocess_ms:.1f} ms",
 			f"fps: {fps:.1f}",
-			f"min area: {estimator.min_area_px:.0f}px",
-			f"square size: {estimator.square_size_cm:.1f}cm",
 		]
 	else:
-		position = detection.position_tello_cm
-		if position is None:
-			position_text = "tello tvec: unavailable"
-		else:
-			position_text = f"tello cm: X {position[0]:.1f}, Y {position[1]:.1f}, Z {position[2]:.1f}"
-		thickness_text = "thickness px: n/a"
-		if detection.thickness_px is not None:
-			thickness_text = f"thickness px: {detection.thickness_px:.1f}"
-		drone_position_text = "drone world: n/a"
-		if object_position_cm is not None:
-			camera_world_pose = estimate_camera_world_pose(detection, object_position_cm, object_yaw_deg)
-			if camera_world_pose is not None:
-				wx, wy, wz = camera_world_pose.position_cm
-				drone_position_text = f"drone world cm: {wx:.1f}, {wy:.1f}, {wz:.1f}"
-		outer_rect = cv2.minAreaRect(detection.contour)
-		outer_w, outer_h = outer_rect[1]
 		status_lines = [
 			f"model: {model_name}",
 			f"target: {detection.class_name or detection.class_id or 'square'}",
 			f"method: {detection.pose_method}",
-			f"read: {read_ms:.1f} ms",
 			f"inference: {inference_ms:.1f} ms",
-			f"post: {postprocess_ms:.1f} ms",
 			f"fps: {fps:.1f}",
 			f"score: {detection.score:.1f}   conf: {detection.confidence:.2f}   pose: {detection.pose_confidence:.2f}",
-			f"range px: {outer_w:.1f} x {outer_h:.1f}",
-			f"center px: ({detection.center_px[0]:.1f}, {detection.center_px[1]:.1f})",
-			thickness_text,
-			position_text,
-			drone_position_text,
 		]
 	if slam_status:
 		status_lines.append(f"slam: {slam_status}")
