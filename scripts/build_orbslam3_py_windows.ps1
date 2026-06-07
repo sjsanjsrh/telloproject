@@ -25,12 +25,108 @@ function Find-VsDevCmd {
 	throw "Visual Studio Developer Command Prompt not found."
 }
 
+function Set-TextFile($path, $text) {
+	[System.IO.File]::WriteAllText($path, $text, [System.Text.UTF8Encoding]::new($false))
+}
+
+function Replace-Required($text, $old, $new, $description) {
+	if (-not $text.Contains($old)) {
+		throw "Could not patch ORB-SLAM3 vocabulary loader: expected $description block was not found."
+	}
+	return $text.Replace($old, $new)
+}
+
+function Patch-OrbVocabularyLoader {
+	$path = Join-Path $orbRoot "DBoW2\DBoW2\TemplatedVocabulary.h"
+	if (!(Test-Path $path)) {
+		throw "ORB-SLAM3 vocabulary loader not found: $path"
+	}
+
+	$text = Get-Content $path -Raw
+	if ($text.Contains("binaryFilename") -and $text.Contains("cache open error, continuing without cache")) {
+		return
+	}
+
+	$text = $text.Replace("`r`n", "`n")
+	$text = Replace-Required $text @'
+    FILE* fpnodes = NULL;
+
+#ifndef USE_BINARY_VOC // Reading "ORBvoc.txt" in binary format to speed-up on Windows
+'@ @'
+    FILE* fpnodes = NULL;
+    const size_t slash = filename.find_last_of("\\/");
+    const std::string binaryFilename =
+        (slash == std::string::npos) ? "ORBvoc.bin" : filename.substr(0, slash + 1) + "ORBvoc.bin";
+
+#ifndef USE_BINARY_VOC // Reading "ORBvoc.txt" in binary format to speed-up on Windows
+'@ "cache path setup"
+
+	$text = Replace-Required $text @'
+    if (f.eof())
+        return false;
+'@ @'
+    if (!f.is_open() || f.eof())
+        return false;
+'@ "text vocabulary open check"
+
+	$text = Replace-Required $text @'
+    if ((fpnodes = fopen("Vocabulary\\ORBvoc.bin", "wb")) == NULL)
+        printf("ORBvoc.bin open error!\n");
+'@ @'
+    if ((fpnodes = fopen(binaryFilename.c_str(), "wb")) == NULL)
+        printf("ORBvoc.bin cache open error, continuing without cache.\n");
+'@ "binary cache writer open"
+
+	$text = Replace-Required $text @'
+    while (!f.eof())
+    {
+        string snode;
+        getline(f, snode);
+'@ @'
+    string snode;
+    while (getline(f, snode))
+    {
+        if (snode.empty())
+            continue;
+'@ "text node loop"
+
+	$text = $text.Replace("        fwrite(&pid, 1, sizeof(int), fpnodes);", "        if (fpnodes)`n            fwrite(&pid, 1, sizeof(int), fpnodes);")
+	$text = $text.Replace("        fwrite(&nIsLeaf, 1, sizeof(int), fpnodes);", "        if (fpnodes)`n            fwrite(&nIsLeaf, 1, sizeof(int), fpnodes);")
+	$text = $text.Replace("        fwrite(m_nodes[nid].descriptor.ptr<unsigned char>(), 32, sizeof(char), fpnodes);", "        if (fpnodes)`n            fwrite(m_nodes[nid].descriptor.ptr<unsigned char>(), 32, sizeof(char), fpnodes);")
+	$text = $text.Replace("        fwrite(&m_nodes[nid].weight, 1, sizeof(double), fpnodes);", "        if (fpnodes)`n            fwrite(&m_nodes[nid].weight, 1, sizeof(double), fpnodes);")
+
+	$text = Replace-Required $text @'
+    if ((fpnodes = fopen("Vocabulary\\ORBvoc.bin", "rb")) == NULL)
+        printf("ORBvoc.bin open error!\n");
+'@ @'
+    if ((fpnodes = fopen(binaryFilename.c_str(), "rb")) == NULL)
+    {
+        printf("ORBvoc.bin open error!\n");
+        return false;
+    }
+'@ "binary vocabulary reader open"
+
+	$text = Replace-Required $text @'
+    fclose(fpnodes);
+    return true;
+'@ @'
+    if (fpnodes)
+        fclose(fpnodes);
+    return true;
+'@ "vocabulary cache close"
+
+	Set-TextFile $path $text
+	Write-Host "Patched ORB-SLAM3 vocabulary loader."
+}
+
 if (!(Test-Path $orbRoot)) {
 	throw "ORB-SLAM3 Windows tree not found: $orbRoot. Run scripts\build_orbslam3_windows.ps1 first."
 }
 if (!(Test-Path $moduleSource)) {
 	throw "Module source not found: $moduleSource"
 }
+
+Patch-OrbVocabularyLoader
 
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
