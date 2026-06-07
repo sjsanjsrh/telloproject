@@ -192,6 +192,7 @@ class OrbSlam3PythonBackend(SlamBackend):
 
 def _default_orbslam3_vocabulary() -> Path:
 	candidates = [
+		Path("third_party") / "orbslam3_windows" / "ORB_SLAM3" / "Vocabulary" / "ORBvoc.bin",
 		Path("third_party") / "orbslam3_windows" / "ORB_SLAM3" / "Vocabulary" / "ORBvoc.txt",
 	]
 	for candidate in candidates:
