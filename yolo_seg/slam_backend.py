@@ -8,7 +8,7 @@ from typing import Any, Optional
 
 import numpy as np
 
-from yolo_seg.world_pose import CameraWorldPose, yaw_rotation_matrix_z
+from yolo_seg.world_pose import CameraWorldPose, opencv_to_tello_rotation, opencv_to_tello_vector, yaw_rotation_matrix_z
 
 
 @dataclass
@@ -104,6 +104,23 @@ def parse_slam_pose(record: dict[str, Any], scale_to_cm: float = 1.0, source: st
 	)
 
 
+def convert_orbslam3_record_to_tello(record: dict[str, Any]) -> dict[str, Any]:
+	"""Convert ORB-SLAM3/OpenCV camera axes to Tello axes for front camera use.
+
+	ORB/OpenCV camera axes are X right, Y down, Z forward.
+	Project Tello axes are X forward, Y right, Z up.
+	"""
+
+	converted = dict(record)
+	if record.get("position") is not None:
+		converted["position"] = opencv_to_tello_vector(record["position"]).tolist()
+	if record.get("position_cm") is not None:
+		converted["position_cm"] = opencv_to_tello_vector(record["position_cm"]).tolist()
+	if record.get("rotation_matrix") is not None:
+		converted["rotation_matrix"] = opencv_to_tello_rotation(record["rotation_matrix"]).tolist()
+	return converted
+
+
 class OrbSlam3PythonBackend(SlamBackend):
 	"""Run ORB-SLAM3 in-process through orbslam3_py.pyd."""
 
@@ -154,6 +171,7 @@ class OrbSlam3PythonBackend(SlamBackend):
 		try:
 			height, width = frame.shape[:2]
 			record = self._tracker.track(frame, time.time())
+			record = convert_orbslam3_record_to_tello(record)
 			self._last_record = record
 			self._frames_tracked += 1
 			self._last_shape = (int(width), int(height))

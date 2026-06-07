@@ -35,6 +35,7 @@ from camera_calibration.camera_tranceform import load_camera_params
 from telloController import TelloController
 from yolo_seg.flight_plan import flight_plan_points, load_flight_plan, nearest_path_point
 from yolo_seg.pnp_pos_est import SquarePoseDetection, YoloSquarePoseEstimator
+from yolo_seg.pose_fusion import CommandPoseTracker, PoseFusion
 from yolo_seg.scene_map import Obstacle, SceneMap, load_scene_map
 from yolo_seg.scene_3d_viz import create_scene_3d_visualizer
 from yolo_seg.slam_backend import SlamPose, create_slam_backend
@@ -79,6 +80,10 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--window-name", default="pnp_pos_est_horizontal", help="OpenCV window name")
 	parser.add_argument("--no-3d", action="store_true", help="Disable the separate 3D scene window")
 	parser.add_argument("--3d-renderer", dest="scene_3d_renderer", default="gpu", choices=("gpu", "cpu"), help="3D scene renderer backend")
+	parser.add_argument("--command-prior", action="store_true", help="Use flight path as the currently commanded trajectory prior")
+	parser.add_argument("--command-speed-cm-s", type=float, default=50.0, help="Command trajectory speed when --command-prior is enabled")
+	parser.add_argument("--command-noise-cm", type=float, default=45.0, help="Kalman measurement noise for command prior")
+	parser.add_argument("--command-start-index", type=int, default=0, help="Flight path segment index to start command prior from")
 	parser.add_argument("--slam-backend", default="none", choices=("none", "orbslam3_py"), help="SLAM pose source")
 	parser.add_argument("--slam-scale-cm", type=float, default=100.0, help="Scale for SLAM position records without position_cm, e.g. meters to cm")
 	parser.add_argument("--orbslam3-vocab", default=None, help="ORB-SLAM3 vocabulary file, usually ORBvoc.txt")
@@ -181,6 +186,8 @@ def estimate_camera_fov_deg(camera_matrix: np.ndarray) -> tuple[float, float]:
 def build_pose_markers(
 	vision_pose: Optional[CameraWorldPose],
 	slam_pose: Optional[SlamPose],
+	fused_pose: Optional[CameraWorldPose],
+	command_pose: Optional[CameraWorldPose],
 	path_projection: Optional[dict],
 	pose_confidence: float = 0.0,
 	slam_status: Optional[str] = None,
@@ -223,6 +230,22 @@ def build_pose_markers(
 				"label": "vision",
 				"position_cm": vision_pose.position_cm,
 				"color_bgr": (0, 255, 120),
+			}
+		)
+	if fused_pose is not None:
+		markers.append(
+			{
+				"label": "fused",
+				"position_cm": fused_pose.position_cm,
+				"color_bgr": (245, 245, 245),
+			}
+		)
+	if command_pose is not None:
+		markers.append(
+			{
+				"label": "cmd",
+				"position_cm": command_pose.position_cm,
+				"color_bgr": (70, 210, 255),
 			}
 		)
 	return markers
@@ -483,6 +506,15 @@ def main() -> None:
 	source = parse_source(args.source)
 	scene_map = load_optional_scene_map(args.scene_map)
 	flight_path_points = flight_plan_points(load_flight_plan(args.flight_plan))
+	command_tracker = (
+		CommandPoseTracker(
+			flight_path_points,
+			speed_cm_s=args.command_speed_cm_s,
+			start_index=args.command_start_index,
+		)
+		if args.command_prior and flight_path_points
+		else None
+	)
 	config_obstacle = resolve_obstacle(scene_map, args.object_id) or first_obstacle(scene_map)
 	object_position_cm = parse_vector3(args.object_position_cm)
 	object_yaw_deg = args.object_yaw_deg
@@ -529,6 +561,8 @@ def main() -> None:
 	last_camera_world_pose = None
 	last_camera_local_detection_cm = None
 	slam_pose = None
+	pose_fusion = PoseFusion()
+	fused_pose = None
 	path_projection = None
 
 	try:
@@ -574,6 +608,21 @@ def main() -> None:
 					path_projection = nearest_path_point(flight_path_points, camera_world_pose.position_cm)
 			if detection is not None and detection.position_cm is not None:
 				last_camera_local_detection_cm = detection.position_cm
+			now = time.time()
+			command_result = command_tracker.current_pose(now) if command_tracker is not None else None
+			command_pose = command_result.camera_world_pose if command_result is not None else None
+			fused_result = pose_fusion.update(
+				slam_pose=slam_pose,
+				pnp_pose=camera_world_pose,
+				pnp_confidence=detection.pose_confidence if detection is not None else 0.0,
+				command_pose=command_pose,
+				command_noise_cm=args.command_noise_cm,
+				flight_path_points=flight_path_points,
+				timestamp=now,
+			)
+			if fused_result is not None:
+				fused_pose = fused_result.camera_world_pose
+				path_projection = nearest_path_point(flight_path_points, fused_pose.position_cm)
 			dashboard = build_horizontal_dashboard(
 				frame=frame,
 				result=result,
@@ -602,9 +651,15 @@ def main() -> None:
 			cv2.imshow(args.window_name, dashboard)
 			if scene_3d is not None:
 				visible_camera_pose = (
-					slam_pose.camera_world_pose
+					fused_pose
+					if fused_pose is not None
+					else camera_world_pose
+					if camera_world_pose is not None
+					else last_camera_world_pose
+					if last_camera_world_pose is not None
+					else slam_pose.camera_world_pose
 					if slam_pose is not None
-					else camera_world_pose if camera_world_pose is not None else last_camera_world_pose
+					else None
 				)
 				scene_3d.show(
 					scene_map,
@@ -617,8 +672,10 @@ def main() -> None:
 					),
 					flight_path_points=flight_path_points,
 					pose_markers=build_pose_markers(
-						visible_camera_pose,
+						camera_world_pose,
 						slam_pose,
+						fused_pose,
+						command_pose,
 						path_projection,
 						pose_confidence=detection.pose_confidence if detection is not None else 0.0,
 						slam_status=slam_backend.status_text(),

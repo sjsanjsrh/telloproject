@@ -112,7 +112,7 @@ class Scene3DVisualizer:
 			dtype=np.float64,
 		)
 		view = pitch_matrix @ yaw_matrix @ point
-		return np.array([view[0], view[2], view[1]], dtype=np.float64)
+		return np.array([view[1], view[2], view[0]], dtype=np.float64)
 
 	def _project(self, point_cm) -> tuple[int, int]:
 		x, y, _z = self._view_point(point_cm)
@@ -522,8 +522,8 @@ class OpenGLScene3DVisualizer:
 		gl.glLoadIdentity()
 		gl.glTranslated(0.0, 0.0, -self.distance_cm)
 		gl.glRotated(self.pitch_deg, 1.0, 0.0, 0.0)
-		gl.glRotated(self.yaw_deg, 0.0, 0.0, 1.0)
-		gl.glTranslated(-100.0, -80.0, -60.0)
+		gl.glRotated(self.yaw_deg, 0.0, 1.0, 0.0)
+		gl.glTranslated(-80.0, -60.0, 100.0)
 
 	def _color(self, bgr):
 		b, g, r = bgr
@@ -531,7 +531,7 @@ class OpenGLScene3DVisualizer:
 
 	def _vertex(self, point):
 		x, y, z = np.asarray(point, dtype=np.float64).reshape(3)
-		self._gl.glVertex3d(float(x), float(y), float(z))
+		self._gl.glVertex3d(float(y), float(z), float(-x))
 
 	def _line(self, point_a, point_b, color, width: float = 2.0):
 		gl = self._gl
@@ -675,7 +675,7 @@ class OpenGLScene3DVisualizer:
 		gl.glEnable(GL_BLEND)
 		gl.glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 		gl.glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
-		gl.glRasterPos3d(float(x), float(y), float(z))
+		gl.glRasterPos3d(float(y), float(z), float(-x))
 		gl.glDrawPixels(width, height, GL_RGBA, GL_UNSIGNED_BYTE, buffer)
 		gl.glDisable(GL_BLEND)
 		gl.glEnable(GL_DEPTH_TEST)
