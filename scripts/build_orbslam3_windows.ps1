@@ -69,9 +69,11 @@ function Patch-MatrixOperations {
 function Patch-ProjectSettings {
 	$path = Join-Path $orbRoot "slam.vcxproj"
 	$text = Get-Content $path -Raw
-	$text = $text -replace "(<PropertyGroup Condition=`"'`$\(Configuration\)\|`$\(Platform\)'=='Release\|x64'`" Label=`"Configuration`">[\s\S]*?)<WholeProgramOptimization>true</WholeProgramOptimization>", '$1<WholeProgramOptimization>false</WholeProgramOptimization>'
+	$releasePropertyGroupPattern = "(<PropertyGroup Condition=`"'`$\(Configuration\)\|`$\(Platform\)'=='Release\|x64'`" Label=`"Configuration`">[\s\S]*?)<WholeProgramOptimization>true</WholeProgramOptimization>"
+	$text = [regex]::Replace($text, $releasePropertyGroupPattern, '$1<WholeProgramOptimization>false</WholeProgramOptimization>')
 	if ($text -notmatch "<Optimization>Disabled</Optimization>") {
-		$text = $text -replace "(<ItemDefinitionGroup Condition=`"'`$\(Configuration\)\|`$\(Platform\)'=='Release\|x64'`">\s*<ClCompile>\s*<WarningLevel>Level3</WarningLevel>)", '$1' + "`r`n      <Optimization>Disabled</Optimization>"
+		$itemDefinitionPattern = "(<ItemDefinitionGroup Condition=`"'`$\(Configuration\)\|`$\(Platform\)'=='Release\|x64'`">\s*<ClCompile>\s*<WarningLevel>Level3</WarningLevel>)"
+		$text = [regex]::Replace($text, $itemDefinitionPattern, '$1' + "`r`n      <Optimization>Disabled</Optimization>")
 	}
 	Set-TextFile $path $text
 }
@@ -216,8 +218,8 @@ int live_mono_main(int argc, char** argv)
 }  // namespace
 
 '@
-	$text = $text -replace '(?s)(int stereo_inertial_tum_vi\(int argc, char\*\* argv\);\s*)', '$1' + $livePatch
-	$text = $text -replace '(int main\(int argc, char\*\* argv\)\s*\{\s*)', '$1' + "`r`n    if (argc > 1 && 0 == strcmp(argv[1], `"--mode`")) {`r`n        return live_mono_main(argc, argv);`r`n    }`r`n"
+	$text = [regex]::Replace($text, '(?s)(int stereo_inertial_tum_vi\(int argc, char\*\* argv\);\s*)', '$1' + $livePatch)
+	$text = [regex]::Replace($text, '(int main\(int argc, char\*\* argv\)\s*\{\s*)', '$1' + "`r`n    if (argc > 1 && 0 == strcmp(argv[1], `"--mode`")) {`r`n        return live_mono_main(argc, argv);`r`n    }`r`n")
 	Set-TextFile $path $text
 }
 
