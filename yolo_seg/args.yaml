@@ -84,4 +84,4 @@ cutmix: 0.0 # cutmix probability
 copy_paste: 0.0 # copy-paste probability
 copy_paste_mode: mixup # copy-paste mode
 auto_augment: randaugment # auto augmentation policy
-erasing: 0.2 # random erasing
+erasing: 0.0 # random erasing
