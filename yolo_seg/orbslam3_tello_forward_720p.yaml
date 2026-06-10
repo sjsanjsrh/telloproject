@@ -16,11 +16,11 @@ Camera.k3: 0.6111132802871541
 Camera.fps: 30.0
 Camera.RGB: 0
 
-ORBextractor.nFeatures: 1200
+ORBextractor.nFeatures: 1800
 ORBextractor.scaleFactor: 1.2
 ORBextractor.nLevels: 8
-ORBextractor.iniThFAST: 20
-ORBextractor.minThFAST: 7
+ORBextractor.iniThFAST: 12
+ORBextractor.minThFAST: 5
 
 Viewer.KeyFrameSize: 0.05
 Viewer.KeyFrameLineWidth: 1

@@ -208,15 +208,7 @@ def contour_to_square_corners(contour: np.ndarray) -> Optional[np.ndarray]:
 	if corners is not None:
 		return corners
 
-	perimeter = cv2.arcLength(contour_float, True)
-	approx = cv2.approxPolyDP(contour_float, 0.02 * perimeter, True)
-
-	if len(approx) == 4 and cv2.isContourConvex(approx):
-		return order_points(approx.reshape(-1, 2))
-
-	rect = cv2.minAreaRect(contour_float)
-	box = cv2.boxPoints(rect)
-	return order_points(box)
+	return None
 
 
 def contours_from_mask(mask: np.ndarray, output_shape: Optional[tuple[int, int]] = None) -> list[np.ndarray]:

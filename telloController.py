@@ -28,11 +28,17 @@ class TelloController(Tello):
             return self.__frame.copy()
 
     def __del__(self):
-        super().__del__()
         try:
             if self.__motor_on:
                 self.turn_motor_off()
-            self.streamoff()
+        except:
+            pass
+        try:
+            self.closseVideo()
+        except:
+            pass
+        try:
+            super().__del__()
         except:
             pass
 
@@ -163,12 +169,24 @@ class TelloController(Tello):
 
     def closseVideo(self):
         self.__video_session_id += 1
-        self.streamoff()
+        self.__frame_callback = None
+        self.__show_video = False
+        try:
+            if self.__frame_read is not None and hasattr(self.__frame_read, "stop"):
+                self.__frame_read.stop()
+        except:
+            pass
+        try:
+            self.streamoff()
+        except:
+            pass
         if self.thread_readFrame is not None and self.thread_readFrame.is_alive() and self.thread_readFrame is not current_thread():
-            self.thread_readFrame.join()
+            self.thread_readFrame.join(timeout=2.0)
         if self.thread_readFrame is not None and not self.thread_readFrame.is_alive():
             self.thread_readFrame = None
         self.__frame_read = None
+        with self.__lock:
+            self.__frame = None
         cv2.destroyAllWindows()
 
     def get_attitude(self):

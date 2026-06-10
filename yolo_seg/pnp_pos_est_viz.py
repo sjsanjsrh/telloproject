@@ -15,9 +15,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import sys
 import shutil
+import threading
 import time
+import xml.etree.ElementTree as ET
 from time import perf_counter
 from pathlib import Path
 from typing import Optional
@@ -75,21 +79,238 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--min-area-px", type=float, default=200.0, help="Minimum contour area in pixels")
 	parser.add_argument("--imgsz", type=int, default=640, help="Inference image size")
 	parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold")
+	parser.add_argument("--yolo-fps", type=float, default=0.0, help="Maximum YOLO inference FPS; 0 means unlimited/latest frame")
+	parser.add_argument("--slam-fps", type=float, default=0.0, help="Maximum SLAM input FPS; 0 means unlimited/latest frame")
 	parser.add_argument("--device", default="auto", help="Inference device, e.g. auto, intel:NPU, cpu")
 	parser.add_argument("--panel-height", type=int, default=360, help="Output panel height")
 	parser.add_argument("--window-name", default="pnp_pos_est_horizontal", help="OpenCV window name")
 	parser.add_argument("--no-3d", action="store_true", help="Disable the separate 3D scene window")
 	parser.add_argument("--3d-renderer", dest="scene_3d_renderer", default="gpu", choices=("gpu", "cpu"), help="3D scene renderer backend")
+	parser.add_argument("--slam-only-viz", action="store_true", help="In 3D view, show only the converted SLAM camera pose, not PnP/fused pose")
 	parser.add_argument("--command-prior", action="store_true", help="Use flight path as the currently commanded trajectory prior")
 	parser.add_argument("--command-speed-cm-s", type=float, default=50.0, help="Command trajectory speed when --command-prior is enabled")
 	parser.add_argument("--command-noise-cm", type=float, default=45.0, help="Kalman measurement noise for command prior")
 	parser.add_argument("--command-start-index", type=int, default=0, help="Flight path segment index to start command prior from")
 	parser.add_argument("--slam-backend", default="none", choices=("none", "orbslam3_py"), help="SLAM pose source")
 	parser.add_argument("--slam-scale-cm", type=float, default=100.0, help="Scale for SLAM position records without position_cm, e.g. meters to cm")
+	parser.add_argument("--slam-sync", action="store_true", help="Run SLAM track() in the visualization loop instead of the SLAM worker thread")
+	parser.add_argument("--slam-input", default="bgr", choices=("bgr", "gray"), help="Frame format passed to ORB-SLAM3")
 	parser.add_argument("--orbslam3-vocab", default=None, help="ORB-SLAM3 vocabulary file, usually ORBvoc.txt")
 	parser.add_argument("--orbslam3-settings", default=None, help="ORB-SLAM3 camera/settings YAML")
 	parser.add_argument("--orbslam3-py-module", default=None, help="Path to orbslam3_py .pyd module for in-process SLAM")
 	return parser.parse_args()
+
+
+def _update_fps_ema(previous: float, last_time: Optional[float], current_time: float) -> tuple[float, float]:
+	if last_time is None:
+		return previous, current_time
+	delta = current_time - last_time
+	if delta <= 0.0:
+		return previous, current_time
+	instant_fps = 1.0 / delta
+	return (instant_fps if previous == 0.0 else previous * 0.9 + instant_fps * 0.1), current_time
+
+
+def preprocess_slam_frame(frame: np.ndarray, input_mode: str) -> np.ndarray:
+	if input_mode == "gray":
+		return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+	return frame
+
+
+def slam_frame_stats(frame: Optional[np.ndarray]) -> str:
+	if frame is None:
+		return "slam input none"
+	gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+	mean = float(np.mean(gray))
+	std = float(np.std(gray))
+	lap = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+	height, width = gray.shape[:2]
+	channels = 1 if frame.ndim == 2 else frame.shape[2]
+	return f"input {width}x{height}x{channels} mean={mean:.1f} std={std:.1f} lap={lap:.1f}"
+
+
+class LatestFrameYoloWorker:
+	def __init__(
+		self,
+		model: YOLO,
+		estimator: YoloSquarePoseEstimator,
+		imgsz: int,
+		conf: float,
+		device: str,
+		max_fps: float,
+	):
+		self.model = model
+		self.estimator = estimator
+		self.imgsz = int(imgsz)
+		self.conf = float(conf)
+		self.device = device
+		self.period = (1.0 / max_fps) if max_fps > 0.0 else 0.0
+		self._lock = threading.Lock()
+		self._stop_event = threading.Event()
+		self._thread = threading.Thread(target=self._run, name="pnp-yolo-worker", daemon=True)
+		self._pending_frame = None
+		self._latest_output = None
+		self._last_run_at = None
+		self._fps_ema = 0.0
+		self._sequence = 0
+
+	def start(self) -> None:
+		self._thread.start()
+
+	def submit(self, frame: np.ndarray) -> None:
+		with self._lock:
+			if self._pending_frame is not None:
+				return
+			self._pending_frame = frame.copy()
+
+	def poll(self):
+		with self._lock:
+			return self._latest_output
+
+	def stop(self) -> bool:
+		self._stop_event.set()
+		self._thread.join(timeout=2.0)
+		return not self._thread.is_alive()
+
+	def _take_frame(self):
+		with self._lock:
+			frame = self._pending_frame
+			self._pending_frame = None
+			return frame
+
+	def _publish(self, output) -> None:
+		with self._lock:
+			self._latest_output = output
+
+	def _run(self) -> None:
+		while not self._stop_event.is_set():
+			now = perf_counter()
+			if self._last_run_at is not None and self.period > 0.0:
+				sleep_seconds = self.period - (now - self._last_run_at)
+				if sleep_seconds > 0.0:
+					self._stop_event.wait(min(sleep_seconds, 0.01))
+					continue
+
+			frame = self._take_frame()
+			if frame is None:
+				self._stop_event.wait(0.002)
+				continue
+
+			try:
+				run_started_at = perf_counter()
+				self._fps_ema, self._last_run_at = _update_fps_ema(self._fps_ema, self._last_run_at, run_started_at)
+				inference_start = perf_counter()
+				results = self.model.predict(frame, imgsz=self.imgsz, conf=self.conf, device=self.device, verbose=False)
+				inference_ms = (perf_counter() - inference_start) * 1000.0
+				result = results[0] if results else None
+				detections = self.estimator.estimate_all_from_result(result) if result is not None else []
+				self._sequence += 1
+				self._publish(
+					{
+						"sequence": self._sequence,
+						"frame": frame,
+						"result": result,
+						"detections": detections,
+						"inference_ms": inference_ms,
+						"fps": self._fps_ema,
+						"error": None,
+					}
+				)
+			except Exception as exc:
+				self._sequence += 1
+				self._publish(
+					{
+						"sequence": self._sequence,
+						"frame": frame,
+						"result": None,
+						"detections": [],
+						"inference_ms": 0.0,
+						"fps": self._fps_ema,
+						"error": str(exc),
+					}
+				)
+
+
+class LatestFrameSlamPump:
+	def __init__(self, slam_backend, max_fps: float, input_mode: str = "bgr"):
+		self.slam_backend = slam_backend
+		self.period = (1.0 / max_fps) if max_fps > 0.0 else 0.0
+		self.input_mode = input_mode
+		self._lock = threading.Lock()
+		self._stop_event = threading.Event()
+		self._thread = threading.Thread(target=self._run, name="pnp-slam-pump", daemon=True)
+		self._pending_frame = None
+		self._last_push_at = None
+		self._fps_ema = 0.0
+		self._submitted = 0
+		self._accepted = 0
+		self._dropped = 0
+		self._processed = 0
+		self._last_input_stats = "slam input none"
+
+	def start(self) -> None:
+		self._thread.start()
+
+	def submit(self, frame: np.ndarray) -> None:
+		with self._lock:
+			self._submitted += 1
+			if self._pending_frame is not None:
+				self._dropped += 1
+				return
+			self._accepted += 1
+			self._pending_frame = frame.copy()
+
+	def fps(self) -> float:
+		with self._lock:
+			return self._fps_ema
+
+	def stats_text(self) -> str:
+		with self._lock:
+			pending = 1 if self._pending_frame is not None else 0
+			return f"slam q={pending} in={self._accepted}/{self._submitted} drop={self._dropped} proc={self._processed} {self._last_input_stats}"
+
+	def is_alive(self) -> bool:
+		return self._thread.is_alive()
+
+	def stop(self) -> bool:
+		self._stop_event.set()
+		self._thread.join(timeout=2.0)
+		return not self._thread.is_alive()
+
+	def _take_frame(self):
+		with self._lock:
+			frame = self._pending_frame
+			self._pending_frame = None
+			return frame
+
+	def _set_fps(self, fps_ema: float) -> None:
+		with self._lock:
+			self._fps_ema = fps_ema
+
+	def _run(self) -> None:
+		while not self._stop_event.is_set():
+			now = perf_counter()
+			if self._last_push_at is not None and self.period > 0.0:
+				sleep_seconds = self.period - (now - self._last_push_at)
+				if sleep_seconds > 0.0:
+					self._stop_event.wait(min(sleep_seconds, 0.01))
+					continue
+
+			frame = self._take_frame()
+			if frame is None:
+				self._stop_event.wait(0.002)
+				continue
+
+			if hasattr(self.slam_backend, "push_frame"):
+				push_started_at = perf_counter()
+				new_fps_ema, self._last_push_at = _update_fps_ema(self._fps_ema, self._last_push_at, push_started_at)
+				slam_frame = preprocess_slam_frame(frame, self.input_mode)
+				input_stats = slam_frame_stats(slam_frame)
+				self.slam_backend.push_frame(slam_frame)
+				with self._lock:
+					self._processed += 1
+					self._fps_ema = new_fps_ema
+					self._last_input_stats = input_stats
 
 
 def _normalize_device_name(device_name: str) -> str:
@@ -104,20 +325,101 @@ def _openvino_model_dir(model_path: str | Path) -> Path:
 	return model_path.parent / f"{model_path.stem}_openvino_model"
 
 
+def _read_openvino_input_size(openvino_dir: str | Path) -> Optional[int]:
+	xml_files = sorted(Path(openvino_dir).glob("*.xml"))
+	if not xml_files:
+		return None
+
+	root = ET.parse(xml_files[0]).getroot()
+	for layer in root.iter():
+		if layer.attrib.get("type") != "Parameter":
+			continue
+
+		shape = layer.attrib.get("shape") or layer.findtext("data/shape")
+		if shape:
+			dims = [
+				int(value)
+				for value in shape.replace("[", "").replace("]", "").replace(",", " ").split()
+				if value.strip().lstrip("-").isdigit()
+			]
+			if len(dims) >= 4 and dims[-1] == dims[-2]:
+				return int(dims[-1])
+
+		dims = []
+		for dim in layer.iter():
+			if dim.tag.endswith("dim") and dim.text and dim.text.strip().lstrip("-").isdigit():
+				dims.append(int(dim.text.strip()))
+		if len(dims) >= 4 and dims[-1] == dims[-2]:
+			return int(dims[-1])
+
+	return None
+
+
+def _file_sha256(path: str | Path) -> str:
+	digest = hashlib.sha256()
+	with open(path, "rb") as file_handle:
+		for chunk in iter(lambda: file_handle.read(1024 * 1024), b""):
+			digest.update(chunk)
+	return digest.hexdigest()
+
+
+def _openvino_manifest_path(openvino_dir: str | Path) -> Path:
+	return Path(openvino_dir) / "telloproject_export_manifest.json"
+
+
+def _read_openvino_manifest(openvino_dir: str | Path) -> dict:
+	manifest_path = _openvino_manifest_path(openvino_dir)
+	if not manifest_path.exists():
+		return {}
+	try:
+		with open(manifest_path, "r", encoding="utf-8") as file_handle:
+			return json.load(file_handle) or {}
+	except (OSError, json.JSONDecodeError):
+		return {}
+
+
+def _write_openvino_manifest(openvino_dir: str | Path, model_path: str | Path, imgsz: int) -> None:
+	manifest = {
+		"source_model": str(Path(model_path)),
+		"source_sha256": _file_sha256(model_path),
+		"imgsz": int(imgsz),
+		"export_format": "openvino",
+	}
+	with open(_openvino_manifest_path(openvino_dir), "w", encoding="utf-8") as file_handle:
+		json.dump(manifest, file_handle, indent=2, sort_keys=True)
+
+
 def _ensure_openvino_model(model_path: str | Path, imgsz: int) -> Path:
 	"""Export a PyTorch YOLO model to OpenVINO if needed and return the model directory."""
 
 	model_path = Path(model_path)
 	openvino_dir = _openvino_model_dir(model_path)
+	source_hash = _file_sha256(model_path)
 	if openvino_dir.exists() and any(openvino_dir.glob("*.xml")):
-		return openvino_dir
+		existing_imgsz = _read_openvino_input_size(openvino_dir)
+		manifest = _read_openvino_manifest(openvino_dir)
+		hash_matches = manifest.get("source_sha256") == source_hash
+		imgsz_matches = int(manifest.get("imgsz", -1)) == int(imgsz)
+		if existing_imgsz == int(imgsz) and hash_matches and imgsz_matches:
+			return openvino_dir
+		reasons = []
+		if existing_imgsz != int(imgsz):
+			reasons.append(f"shape existing={existing_imgsz}, requested={imgsz}")
+		if not hash_matches:
+			reasons.append("source model hash changed or missing")
+		if not imgsz_matches:
+			reasons.append("export manifest imgsz changed or missing")
+		print(f"OpenVINO model mismatch: {', '.join(reasons)}. Re-exporting.")
+		shutil.rmtree(openvino_dir)
 
 	if openvino_dir.exists():
 		shutil.rmtree(openvino_dir)
 
 	model = YOLO(str(model_path))
 	exported = model.export(format="openvino", imgsz=imgsz, verbose=False)
-	return Path(exported) if exported is not None else openvino_dir
+	exported_dir = Path(exported) if exported is not None else openvino_dir
+	_write_openvino_manifest(exported_dir, model_path, imgsz)
+	return exported_dir
 
 
 def _resolve_inference_model(model_path: str, device: str, imgsz: int) -> tuple[YOLO, str]:
@@ -520,18 +822,23 @@ def build_horizontal_dashboard(
 	object_position_cm: Optional[tuple[float, float, float]],
 	object_yaw_deg: float,
 	slam_status: Optional[str] = None,
+	yolo_fps: float = 0.0,
+	slam_fps: float = 0.0,
+	vision_frame: Optional[np.ndarray] = None,
 ) -> np.ndarray:
+	vision_frame = frame if vision_frame is None else vision_frame
 	original_panel = resize_to_height(frame, panel_height)
-	plot_panel = resize_to_fit_height(build_outline_overlay(frame, result), panel_height) if result is not None else original_panel.copy()
-	pose_panel = resize_to_height(add_detection_info(frame, detection, detections), panel_height)
+	plot_panel = resize_to_fit_height(build_outline_overlay(vision_frame, result), panel_height) if result is not None else resize_to_height(vision_frame, panel_height)
+	pose_panel = resize_to_height(add_detection_info(vision_frame, detection, detections), panel_height)
 
 	if detection is None:
 		status_lines = [
 			f"model: {model_name}",
 			"status: no valid square detection",
 			f"candidates: {len(detections or [])}",
-			f"inference: {inference_ms:.1f} ms",
-			f"fps: {fps:.1f}",
+			f"loop fps: {fps:.1f}   read: {read_ms:.1f} ms",
+			f"yolo fps: {yolo_fps:.1f}   infer: {inference_ms:.1f} ms",
+			f"slam fps: {slam_fps:.1f}   post: {postprocess_ms:.1f} ms",
 		]
 	else:
 		status_lines = [
@@ -539,8 +846,9 @@ def build_horizontal_dashboard(
 			f"target: {detection.class_name or detection.class_id or 'square'}",
 			f"method: {detection.pose_method}",
 			f"candidates: {len(detections or [])}   corners: {detection.corner_count}",
-			f"inference: {inference_ms:.1f} ms",
-			f"fps: {fps:.1f}",
+			f"loop fps: {fps:.1f}   read: {read_ms:.1f} ms",
+			f"yolo fps: {yolo_fps:.1f}   infer: {inference_ms:.1f} ms",
+			f"slam fps: {slam_fps:.1f}   post: {postprocess_ms:.1f} ms",
 			f"score: {detection.score:.1f}   conf: {detection.confidence:.2f}   pose: {detection.pose_confidence:.2f}",
 		]
 	if slam_status:
@@ -559,6 +867,19 @@ def open_capture(source, camera_direction: str, video_resolution: int):
 	if not capture.isOpened():
 		raise RuntimeError(f"Failed to open source: {source}")
 	return capture
+
+
+def resolve_effective_camera_calibration(args, source) -> tuple[Optional[str], Optional[int]]:
+	camera_direction = args.camera
+	resolution = args.resolution
+	if source == "tello":
+		camera_direction = camera_direction or args.camera_direction
+		resolution = resolution or args.video_resolution
+
+	args.effective_camera_profile = args.camera_profile
+	args.effective_camera_direction = camera_direction
+	args.effective_resolution = resolution
+	return camera_direction, resolution
 
 
 def main() -> None:
@@ -581,11 +902,7 @@ def main() -> None:
 	if object_position_cm is None and config_obstacle is not None:
 		object_position_cm = config_obstacle.position_cm
 		object_yaw_deg = config_obstacle.yaw_deg
-	calibration_camera = args.camera
-	calibration_resolution = args.resolution
-	if source == "tello":
-		calibration_camera = calibration_camera or args.camera_direction
-		calibration_resolution = calibration_resolution or args.video_resolution
+	calibration_camera, calibration_resolution = resolve_effective_camera_calibration(args, source)
 
 	camera_matrix, dist_coeffs = load_camera_params(
 		args.camera_params,
@@ -617,7 +934,19 @@ def main() -> None:
 		else None
 	)
 	fps_ema = 0.0
-	last_postprocess_ms = 0.0
+	yolo_worker = LatestFrameYoloWorker(model, estimator, args.imgsz, args.conf, inference_device, args.yolo_fps)
+	slam_pump = None if args.slam_sync else LatestFrameSlamPump(slam_backend, args.slam_fps, input_mode=args.slam_input)
+	slam_period = (1.0 / args.slam_fps) if args.slam_fps > 0.0 else 0.0
+	last_slam_push_at = None
+	slam_fps_ema = 0.0
+	last_result = None
+	last_detections = []
+	last_detection = None
+	last_detection_obstacle = None
+	last_yolo_frame = None
+	last_yolo_sequence = 0
+	last_yolo_fps = 0.0
+	last_inference_ms = 0.0
 	last_camera_world_pose = None
 	last_camera_local_detection_cm = None
 	slam_pose = None
@@ -627,6 +956,9 @@ def main() -> None:
 
 	try:
 		slam_backend.start()
+		yolo_worker.start()
+		if slam_pump is not None:
+			slam_pump.start()
 		while True:
 			frame_start = perf_counter()
 			read_start = perf_counter()
@@ -634,34 +966,63 @@ def main() -> None:
 			read_ms = (perf_counter() - read_start) * 1000.0
 			if not ok or frame is None:
 				break
-			if hasattr(slam_backend, "push_frame"):
-				slam_backend.push_frame(frame)
-
-			inference_start = perf_counter()
-			results = model.predict(frame, imgsz=args.imgsz, conf=args.conf, device=inference_device, verbose=False)
-			inference_ms = (perf_counter() - inference_start) * 1000.0
-			result = results[0] if results else None
+			yolo_worker.submit(frame)
+			if slam_pump is not None:
+				slam_pump.submit(frame)
+				current_slam_fps = slam_pump.fps()
+				slam_transport_status = slam_pump.stats_text()
+			else:
+				slam_now = perf_counter()
+				slam_due = slam_period <= 0.0 or last_slam_push_at is None or (slam_now - last_slam_push_at) >= slam_period
+				if slam_due:
+					slam_fps_ema, last_slam_push_at = _update_fps_ema(slam_fps_ema, last_slam_push_at, slam_now)
+					slam_frame = preprocess_slam_frame(frame, args.slam_input)
+					slam_backend.push_frame(slam_frame)
+					slam_transport_status = f"slam sync {slam_frame_stats(slam_frame)}"
+				else:
+					slam_transport_status = f"slam sync wait {slam_frame_stats(preprocess_slam_frame(frame, args.slam_input))}"
+				current_slam_fps = slam_fps_ema
 
 			postprocess_start = perf_counter()
 			new_slam_pose = slam_backend.poll()
 			if new_slam_pose is not None:
 				slam_pose = new_slam_pose
 				path_projection = nearest_path_point(flight_path_points, slam_pose.position_cm)
-			detections = estimator.estimate_all_from_result(result) if result is not None else []
 			now = time.time()
 			command_result = command_tracker.current_pose(now) if command_tracker is not None else None
 			command_pose = command_result.camera_world_pose if command_result is not None else None
-			detection, detection_obstacle, camera_world_pose = select_pose_detection(
-				detections=detections,
-				scene_map=scene_map,
-				object_id=args.object_id,
-				config_obstacle=config_obstacle,
-				object_position_cm=object_position_cm,
-				object_yaw_deg=object_yaw_deg,
-				command_pose=command_pose,
-				last_camera_world_pose=last_camera_world_pose,
-				slam_pose=slam_pose,
-			)
+
+			camera_world_pose = None
+			yolo_output = yolo_worker.poll()
+			new_yolo_measurement = yolo_output is not None and int(yolo_output["sequence"]) != last_yolo_sequence
+			if new_yolo_measurement:
+				last_yolo_sequence = int(yolo_output["sequence"])
+				last_yolo_frame = yolo_output["frame"]
+				last_result = yolo_output["result"]
+				reference_detection = last_detection
+				last_detections = (
+					estimator.estimate_all_from_result(last_result, reference_detection=reference_detection)
+					if last_result is not None
+					else []
+				)
+				last_inference_ms = float(yolo_output["inference_ms"])
+				last_yolo_fps = float(yolo_output["fps"])
+				last_detection, last_detection_obstacle, camera_world_pose = select_pose_detection(
+					detections=last_detections,
+					scene_map=scene_map,
+					object_id=args.object_id,
+					config_obstacle=config_obstacle,
+					object_position_cm=object_position_cm,
+					object_yaw_deg=object_yaw_deg,
+					command_pose=command_pose,
+					last_camera_world_pose=last_camera_world_pose,
+					slam_pose=slam_pose,
+				)
+
+			result = last_result
+			detections = last_detections
+			detection = last_detection
+			detection_obstacle = last_detection_obstacle
 			reference_obstacle = detection_obstacle or config_obstacle
 			dashboard_object_position_cm = object_position_cm
 			dashboard_object_yaw_deg = object_yaw_deg
@@ -677,7 +1038,7 @@ def main() -> None:
 			fused_result = pose_fusion.update(
 				slam_pose=slam_pose,
 				pnp_pose=camera_world_pose,
-				pnp_confidence=detection.pose_confidence if detection is not None else 0.0,
+				pnp_confidence=detection.pose_confidence if new_yolo_measurement and detection is not None else 0.0,
 				command_pose=command_pose,
 				command_noise_cm=args.command_noise_cm,
 				flight_path_points=flight_path_points,
@@ -686,6 +1047,7 @@ def main() -> None:
 			if fused_result is not None:
 				fused_pose = fused_result.camera_world_pose
 				path_projection = nearest_path_point(flight_path_points, fused_pose.position_cm)
+			postprocess_ms = (perf_counter() - postprocess_start) * 1000.0
 			dashboard = build_horizontal_dashboard(
 				frame=frame,
 				result=result,
@@ -695,14 +1057,16 @@ def main() -> None:
 				model_name=str(args.model),
 				panel_height=args.panel_height,
 				read_ms=read_ms,
-				inference_ms=inference_ms,
-				postprocess_ms=last_postprocess_ms,
+				inference_ms=last_inference_ms,
+				postprocess_ms=postprocess_ms,
 				fps=fps_ema,
 				object_position_cm=dashboard_object_position_cm,
 				object_yaw_deg=dashboard_object_yaw_deg,
-				slam_status=slam_backend.status_text(),
+				slam_status=f"{slam_backend.status_text()} {slam_transport_status}",
+				yolo_fps=last_yolo_fps,
+				slam_fps=current_slam_fps,
+				vision_frame=last_yolo_frame,
 			)
-			last_postprocess_ms = (perf_counter() - postprocess_start) * 1000.0
 
 			frame_end = perf_counter()
 			frame_seconds = frame_end - frame_start
@@ -714,36 +1078,50 @@ def main() -> None:
 
 			cv2.imshow(args.window_name, dashboard)
 			if scene_3d is not None:
-				visible_camera_pose = (
-					fused_pose
-					if fused_pose is not None
-					else camera_world_pose
-					if camera_world_pose is not None
-					else last_camera_world_pose
-					if last_camera_world_pose is not None
-					else slam_pose.camera_world_pose
-					if slam_pose is not None
-					else None
-				)
-				scene_3d.show(
-					scene_map,
-					active_obstacle=detection_obstacle,
-					camera_pose=visible_camera_pose,
-					camera_local_detection_cm=(
-						detection.position_cm
-						if detection is not None and detection.position_cm is not None
-						else last_camera_local_detection_cm
-					),
-					flight_path_points=flight_path_points,
-					pose_markers=build_pose_markers(
-						camera_world_pose,
+				display_camera_world_pose = camera_world_pose if camera_world_pose is not None else last_camera_world_pose
+				if args.slam_only_viz:
+					visible_camera_pose = slam_pose.camera_world_pose if slam_pose is not None else None
+					pose_markers = build_pose_markers(
+						None,
+						slam_pose,
+						None,
+						None,
+						path_projection,
+						pose_confidence=0.0,
+						slam_status=f"{slam_backend.status_text()} {slam_transport_status}",
+					)
+				else:
+					visible_camera_pose = (
+						fused_pose
+						if fused_pose is not None
+						else display_camera_world_pose
+						if display_camera_world_pose is not None
+						else slam_pose.camera_world_pose
+						if slam_pose is not None
+						else None
+					)
+					pose_markers = build_pose_markers(
+						display_camera_world_pose,
 						slam_pose,
 						fused_pose,
 						command_pose,
 						path_projection,
 						pose_confidence=detection.pose_confidence if detection is not None else 0.0,
-						slam_status=slam_backend.status_text(),
+						slam_status=f"{slam_backend.status_text()} {slam_transport_status}",
+					)
+				scene_3d.show(
+					scene_map,
+					active_obstacle=None if args.slam_only_viz else detection_obstacle,
+					camera_pose=visible_camera_pose,
+					camera_local_detection_cm=(
+						None
+						if args.slam_only_viz
+						else detection.position_cm
+						if detection is not None and detection.position_cm is not None
+						else last_camera_local_detection_cm
 					),
+					flight_path_points=flight_path_points,
+					pose_markers=pose_markers,
 				)
 			key = cv2.waitKey(1) & 0xFF
 			if scene_3d is not None and hasattr(scene_3d, "handle_key"):
@@ -751,8 +1129,15 @@ def main() -> None:
 			if key in (27, ord("q")):
 				break
 	finally:
+		yolo_stopped = yolo_worker.stop()
+		slam_stopped = True if slam_pump is None else slam_pump.stop()
+		if not yolo_stopped:
+			print("warning: YOLO worker did not stop within timeout")
+		if not slam_stopped:
+			print("warning: SLAM worker did not stop within timeout; skipping slam backend close")
 		capture.release()
-		slam_backend.close()
+		if slam_stopped:
+			slam_backend.close()
 		cv2.destroyAllWindows()
 
 

@@ -162,4 +162,4 @@ yolo_seg/res/*
 calib_images/
 yolo_seg/data_*
 third_party/*
-yolo_seg/runtime/*
+yolo_seg/.runtime/*

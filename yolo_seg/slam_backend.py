@@ -8,7 +8,10 @@ from typing import Any, Optional
 
 import numpy as np
 
+from camera_calibration.camera_tranceform import load_camera_params, make_profile_name
 from yolo_seg.world_pose import CameraWorldPose, opencv_to_tello_rotation, opencv_to_tello_vector, yaw_rotation_matrix_z
+
+GOOD_SLAM_STATES = {"OK", "TRACKING"}
 
 
 @dataclass
@@ -175,7 +178,12 @@ class OrbSlam3PythonBackend(SlamBackend):
 			self._last_record = record
 			self._frames_tracked += 1
 			self._last_shape = (int(width), int(height))
-			self._last_pose = parse_slam_pose(record, scale_to_cm=self.scale_to_cm, source="orbslam3_py")
+			state = str(record.get("tracking_state", record.get("state", "UNKNOWN"))).upper()
+			self._last_pose = (
+				parse_slam_pose(record, scale_to_cm=self.scale_to_cm, source="orbslam3_py")
+				if state in GOOD_SLAM_STATES
+				else None
+			)
 			self._last_error = None
 		except Exception as exc:
 			self._last_error = str(exc)
@@ -219,6 +227,89 @@ def _default_orbslam3_vocabulary() -> Path:
 	return candidates[0]
 
 
+def _replace_or_append_yaml_value(lines: list[str], key: str, value) -> list[str]:
+	replacement = f"{key}: {value}\n"
+	for index, line in enumerate(lines):
+		if line.strip().startswith(f"{key}:"):
+			lines[index] = replacement
+			return lines
+	lines.append(replacement)
+	return lines
+
+
+def _format_yaml_float(value: float) -> str:
+	return f"{float(value):.12g}"
+
+
+def _resolve_runtime_camera_selection(args) -> tuple[Optional[str], Optional[str], Optional[int]]:
+	camera_profile = getattr(args, "effective_camera_profile", None) or getattr(args, "camera_profile", None)
+	camera_direction = (
+		getattr(args, "effective_camera_direction", None)
+		or getattr(args, "camera", None)
+		or getattr(args, "camera_direction", None)
+	)
+	resolution = (
+		getattr(args, "effective_resolution", None)
+		or getattr(args, "resolution", None)
+		or getattr(args, "video_resolution", None)
+	)
+	return camera_profile, camera_direction, resolution
+
+
+def _make_runtime_orbslam3_settings(base_settings: str | Path, args) -> Path:
+	base_settings = Path(base_settings)
+	with open(base_settings, "r", encoding="utf-8") as file_handle:
+		lines = file_handle.readlines()
+
+	camera_profile, camera_direction, resolution = _resolve_runtime_camera_selection(args)
+
+	camera_params = getattr(args, "camera_params", None)
+	if camera_params:
+		camera_matrix, dist_coeffs = load_camera_params(
+			camera_params,
+			camera_profile=camera_profile,
+			camera_direction=camera_direction,
+			resolution=resolution,
+		)
+		dist = np.asarray(dist_coeffs, dtype=np.float64).reshape(-1)
+		dist_values = [float(dist[index]) if index < len(dist) else 0.0 for index in range(5)]
+		camera_values = {
+			"Camera.fx": camera_matrix[0, 0],
+			"Camera.fy": camera_matrix[1, 1],
+			"Camera.cx": camera_matrix[0, 2],
+			"Camera.cy": camera_matrix[1, 2],
+			"Camera.k1": dist_values[0],
+			"Camera.k2": dist_values[1],
+			"Camera.p1": dist_values[2],
+			"Camera.p2": dist_values[3],
+			"Camera.k3": dist_values[4],
+		}
+		for key, value in camera_values.items():
+			lines = _replace_or_append_yaml_value(lines, key, _format_yaml_float(value))
+
+	slam_fps = float(getattr(args, "slam_fps", 0.0) or 0.0)
+	if slam_fps > 0.0:
+		lines = _replace_or_append_yaml_value(lines, "Camera.fps", _format_yaml_float(slam_fps))
+
+	runtime_dir = Path("yolo_seg") / ".runtime"
+	runtime_dir.mkdir(parents=True, exist_ok=True)
+	profile = make_profile_name(
+		camera_direction=camera_direction,
+		resolution=resolution,
+		camera_profile=camera_profile,
+	) or "default"
+	fps_tag = f"{slam_fps:g}" if slam_fps > 0.0 else "template"
+	runtime_path = runtime_dir / f"{base_settings.stem}_{profile}_fps{fps_tag}.yaml"
+	with open(runtime_path, "w", encoding="utf-8") as file_handle:
+		file_handle.writelines(lines)
+	print(
+		f"ORB-SLAM3 runtime settings: {runtime_path} "
+		f"camera={camera_direction or 'default'} resolution={resolution or 'default'} "
+		f"fps={fps_tag}"
+	)
+	return runtime_path
+
+
 def create_slam_backend(args) -> SlamBackend:
 	backend = getattr(args, "slam_backend", "none")
 	if backend == "none":
@@ -227,8 +318,10 @@ def create_slam_backend(args) -> SlamBackend:
 		vocabulary = args.orbslam3_vocab or _default_orbslam3_vocabulary()
 		settings = args.orbslam3_settings
 		if settings is None:
-			resolution = getattr(args, "video_resolution", 480)
+			_, _, resolution = _resolve_runtime_camera_selection(args)
+			resolution = resolution or 480
 			settings = Path("yolo_seg") / f"orbslam3_tello_forward_{resolution}p.yaml"
+		settings = _make_runtime_orbslam3_settings(settings, args)
 		return OrbSlam3PythonBackend(
 			module_path=getattr(args, "orbslam3_py_module", None),
 			vocabulary=vocabulary,
