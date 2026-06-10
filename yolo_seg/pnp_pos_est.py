@@ -45,6 +45,8 @@ class SquarePoseDetection:
 	pose_method: str = "pnp"
 	thickness_px: Optional[float] = None
 	pose_confidence: float = 0.0
+	corner_count: int = 0
+	avoidance_only: bool = False
 
 	@property
 	def position_cm(self) -> Optional[tuple[float, float, float]]:
@@ -126,8 +128,18 @@ class YoloSquarePoseEstimator:
 		if self.outline_thickness_cm is None:
 			return False
 		if self.outline_class_id is None and self.outline_class_name is None:
-			return False
+			return class_name in {"partial_gate", "partinal_gate"}
 		return self._matches_class(class_id, class_name, names, self.outline_class_id, self.outline_class_name)
+
+	def _visible_corner_count(self, contour: np.ndarray) -> int:
+		contour_float = np.asarray(contour, dtype=np.float32)
+		if len(contour_float) < 4:
+			return int(len(contour_float))
+		perimeter = cv2.arcLength(contour_float, True)
+		if perimeter <= 1e-6:
+			return 0
+		approx = cv2.approxPolyDP(contour_float, 0.025 * perimeter, True)
+		return int(len(approx))
 
 	def _extract_candidate_contours(self, result) -> list[tuple[np.ndarray, float, Optional[int], Optional[str]]]:
 		"""Extract contours from an Ultralytics result or a mask-like object."""
@@ -260,20 +272,20 @@ class YoloSquarePoseEstimator:
 		quality = (0.35 + 0.65 * det_quality) * (0.35 + 0.65 * area_quality)
 		return float(min(1.0, method_weight * quality))
 
-	def estimate_from_result(self, result) -> Optional[SquarePoseDetection]:
-		"""Estimate the best square detection from a YOLO result object."""
+	def estimate_all_from_result(self, result) -> list[SquarePoseDetection]:
+		"""Estimate every usable gate/partial-gate candidate from a YOLO result object."""
 
 		if isinstance(result, (list, tuple)):
 			if not result:
-				return None
+				return []
 			result = result[0]
 
 		candidates = self._extract_candidate_contours(result)
 		if not candidates:
-			return None
+			return []
 
 		names = getattr(result, "names", None)
-		best_detection: Optional[SquarePoseDetection] = None
+		detections: list[SquarePoseDetection] = []
 
 		for contour, confidence, class_id, class_name in candidates:
 			is_outline = self._outline_class_matches(class_id, class_name, names)
@@ -289,7 +301,12 @@ class YoloSquarePoseEstimator:
 				continue
 
 			center_px = contour_center(contour)
-			if is_outline:
+			corner_count = self._visible_corner_count(contour)
+			avoidance_only = bool(is_outline and corner_count <= 3)
+			if avoidance_only:
+				rvec, tvec, thickness_px = None, None, None
+				pose_method = "partial_avoidance"
+			elif is_outline:
 				rvec, tvec, thickness_px = self._estimate_pose_from_outline(contour, center_px)
 				pose_method = "outline_thickness"
 			else:
@@ -318,12 +335,22 @@ class YoloSquarePoseEstimator:
 				pose_method=pose_method,
 				thickness_px=thickness_px,
 				pose_confidence=pose_confidence,
+				corner_count=corner_count,
+				avoidance_only=avoidance_only,
 			)
 
-			if best_detection is None or detection.score > best_detection.score:
-				best_detection = detection
+			detections.append(detection)
 
-		return best_detection
+		detections.sort(key=lambda detection: detection.score, reverse=True)
+		return detections
+
+	def estimate_from_result(self, result) -> Optional[SquarePoseDetection]:
+		"""Estimate the best non-avoidance square detection from a YOLO result object."""
+
+		for detection in self.estimate_all_from_result(result):
+			if not detection.avoidance_only and detection.tvec is not None:
+				return detection
+		return None
 
 	def draw_detection(self, frame: np.ndarray, detection: SquarePoseDetection) -> np.ndarray:
 		"""Draw the detection on a frame and return the annotated image."""

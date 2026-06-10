@@ -284,6 +284,49 @@ def resolve_obstacle(
 	return scene_map.match_detection(detection.class_id, detection.class_name)
 
 
+def select_pose_detection(
+	detections: list[SquarePoseDetection],
+	scene_map: Optional[SceneMap],
+	object_id: Optional[str],
+	config_obstacle: Optional[Obstacle],
+	object_position_cm: Optional[tuple[float, float, float]],
+	object_yaw_deg: float,
+	command_pose: Optional[CameraWorldPose],
+	last_camera_world_pose: Optional[CameraWorldPose],
+	slam_pose: Optional[SlamPose],
+) -> tuple[Optional[SquarePoseDetection], Optional[Obstacle], Optional[CameraWorldPose]]:
+	best: tuple[float, Optional[SquarePoseDetection], Optional[Obstacle], Optional[CameraWorldPose]] = (-float("inf"), None, None, None)
+	for detection in detections:
+		if detection.avoidance_only or detection.tvec is None:
+			continue
+
+		obstacle = resolve_obstacle(scene_map, object_id, detection) or config_obstacle
+		target_position = obstacle.position_cm if obstacle is not None else object_position_cm
+		target_yaw = obstacle.yaw_deg if obstacle is not None else object_yaw_deg
+		if target_position is None:
+			continue
+
+		camera_world_pose = estimate_camera_world_pose(detection, target_position, target_yaw)
+		if camera_world_pose is None:
+			continue
+
+		position = np.asarray(camera_world_pose.position_cm, dtype=np.float64)
+		score = detection.pose_confidence * 1000.0 + detection.confidence * 100.0
+		if command_pose is not None:
+			score -= 0.035 * float(np.linalg.norm(position - np.asarray(command_pose.position_cm, dtype=np.float64)))
+		if last_camera_world_pose is not None:
+			score -= 0.025 * float(np.linalg.norm(position - np.asarray(last_camera_world_pose.position_cm, dtype=np.float64)))
+		if slam_pose is not None:
+			score -= 0.01 * float(np.linalg.norm(position - np.asarray(slam_pose.position_cm, dtype=np.float64)))
+		if detection.pose_method == "outline_thickness":
+			score -= 120.0
+
+		if score > best[0]:
+			best = (score, detection, obstacle, camera_world_pose)
+
+	return best[1], best[2], best[3]
+
+
 class TelloStreamCapture:
 	def __init__(self, camera_direction: str, video_resolution: int):
 		self.tello = TelloController()
@@ -351,16 +394,30 @@ def make_text_panel(width: int, lines: list[str]) -> np.ndarray:
 	return panel
 
 
-def add_detection_info(frame: np.ndarray, detection: Optional[SquarePoseDetection]) -> np.ndarray:
+def add_detection_info(
+	frame: np.ndarray,
+	detection: Optional[SquarePoseDetection],
+	detections: Optional[list[SquarePoseDetection]] = None,
+) -> np.ndarray:
 	output = frame.copy()
-	if detection is None:
+	all_detections = detections or ([detection] if detection is not None else [])
+	if not all_detections:
 		cv2.putText(output, "no detection", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 		return output
 
-	center = tuple(int(round(value)) for value in detection.center_px)
-	corners = detection.corners_px.astype(np.int32).reshape(-1, 1, 2)
-	cv2.polylines(output, [corners], True, (0, 255, 0), 2)
-	cv2.circle(output, center, 4, (0, 0, 255), -1)
+	for index, item in enumerate(all_detections):
+		center = tuple(int(round(value)) for value in item.center_px)
+		corners = item.corners_px.astype(np.int32).reshape(-1, 1, 2)
+		color = (0, 180, 255) if item.avoidance_only else (0, 255, 0)
+		thickness = 3 if item is detection else 1
+		cv2.polylines(output, [corners], True, color, thickness)
+		cv2.circle(output, center, 4, (0, 0, 255), -1)
+		label = f"{index}:{item.class_name or item.class_id or 'gate'} {item.pose_method}"
+		cv2.putText(output, label, (center[0] + 6, center[1] - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+	if detection is None:
+		cv2.putText(output, "avoidance only", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 180, 255), 2, cv2.LINE_AA)
+		return output
 
 	label = f"{detection.pose_method} pose={detection.pose_confidence:.2f} area={detection.area_px:.0f}px conf={detection.confidence:.2f}"
 	if detection.class_name:
@@ -452,6 +509,7 @@ def build_horizontal_dashboard(
 	frame: np.ndarray,
 	result,
 	detection: Optional[SquarePoseDetection],
+	detections: Optional[list[SquarePoseDetection]],
 	estimator: YoloSquarePoseEstimator,
 	model_name: str,
 	panel_height: int,
@@ -465,12 +523,13 @@ def build_horizontal_dashboard(
 ) -> np.ndarray:
 	original_panel = resize_to_height(frame, panel_height)
 	plot_panel = resize_to_fit_height(build_outline_overlay(frame, result), panel_height) if result is not None else original_panel.copy()
-	pose_panel = resize_to_height(add_detection_info(frame, detection), panel_height)
+	pose_panel = resize_to_height(add_detection_info(frame, detection, detections), panel_height)
 
 	if detection is None:
 		status_lines = [
 			f"model: {model_name}",
 			"status: no valid square detection",
+			f"candidates: {len(detections or [])}",
 			f"inference: {inference_ms:.1f} ms",
 			f"fps: {fps:.1f}",
 		]
@@ -479,6 +538,7 @@ def build_horizontal_dashboard(
 			f"model: {model_name}",
 			f"target: {detection.class_name or detection.class_id or 'square'}",
 			f"method: {detection.pose_method}",
+			f"candidates: {len(detections or [])}   corners: {detection.corner_count}",
 			f"inference: {inference_ms:.1f} ms",
 			f"fps: {fps:.1f}",
 			f"score: {detection.score:.1f}   conf: {detection.confidence:.2f}   pose: {detection.pose_confidence:.2f}",
@@ -587,30 +647,33 @@ def main() -> None:
 			if new_slam_pose is not None:
 				slam_pose = new_slam_pose
 				path_projection = nearest_path_point(flight_path_points, slam_pose.position_cm)
-			detection = estimator.estimate_from_result(result) if result is not None else None
-			detection_obstacle = resolve_obstacle(scene_map, args.object_id, detection)
+			detections = estimator.estimate_all_from_result(result) if result is not None else []
+			now = time.time()
+			command_result = command_tracker.current_pose(now) if command_tracker is not None else None
+			command_pose = command_result.camera_world_pose if command_result is not None else None
+			detection, detection_obstacle, camera_world_pose = select_pose_detection(
+				detections=detections,
+				scene_map=scene_map,
+				object_id=args.object_id,
+				config_obstacle=config_obstacle,
+				object_position_cm=object_position_cm,
+				object_yaw_deg=object_yaw_deg,
+				command_pose=command_pose,
+				last_camera_world_pose=last_camera_world_pose,
+				slam_pose=slam_pose,
+			)
 			reference_obstacle = detection_obstacle or config_obstacle
 			dashboard_object_position_cm = object_position_cm
 			dashboard_object_yaw_deg = object_yaw_deg
 			if args.object_position_cm is None and reference_obstacle is not None:
 				dashboard_object_position_cm = reference_obstacle.position_cm
 				dashboard_object_yaw_deg = reference_obstacle.yaw_deg
-			camera_world_pose = None
-			if detection is not None and dashboard_object_position_cm is not None:
-				camera_world_pose = estimate_camera_world_pose(
-					detection,
-					dashboard_object_position_cm,
-					dashboard_object_yaw_deg,
-				)
 			if camera_world_pose is not None:
 				last_camera_world_pose = camera_world_pose
 				if slam_pose is None:
 					path_projection = nearest_path_point(flight_path_points, camera_world_pose.position_cm)
 			if detection is not None and detection.position_cm is not None:
 				last_camera_local_detection_cm = detection.position_cm
-			now = time.time()
-			command_result = command_tracker.current_pose(now) if command_tracker is not None else None
-			command_pose = command_result.camera_world_pose if command_result is not None else None
 			fused_result = pose_fusion.update(
 				slam_pose=slam_pose,
 				pnp_pose=camera_world_pose,
@@ -627,6 +690,7 @@ def main() -> None:
 				frame=frame,
 				result=result,
 				detection=detection,
+				detections=detections,
 				estimator=estimator,
 				model_name=str(args.model),
 				panel_height=args.panel_height,
