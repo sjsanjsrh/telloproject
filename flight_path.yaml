@@ -12,12 +12,12 @@ start:
 waypoints:
   - name: w1
     move_cm: [80, -15, 30]
-    speed: 90
+    speed: 100
     wait_sec: 0.5
 
   - name: w2
     move_cm: [130, 0, -70]
-    speed: 90
+    speed: 100
 
   - name: r90
     rotate_deg: 90
@@ -25,8 +25,8 @@ waypoints:
 
   - name: w3
     move_cm: [80, -28, 70]
-    speed: 90
+    speed: 100
 
   - name: w4
     move_cm: [142, 0, 0]
-    speed: 90
+    speed: 100

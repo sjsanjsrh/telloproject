@@ -13,7 +13,7 @@ Typical usage:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import cv2
@@ -24,6 +24,11 @@ from yolo_seg.geometry import (
 	contour_from_polygon,
 	contour_to_square_corners,
 	contours_from_mask,
+	fit_line_tls,
+	line_distances,
+	line_from_points,
+	line_intersection,
+	order_points,
 )
 from yolo_seg.world_pose import opencv_to_tello_vector
 
@@ -45,6 +50,8 @@ class SquarePoseDetection:
 	pose_method: str = "pnp"
 	thickness_px: Optional[float] = None
 	pose_confidence: float = 0.0
+	corner_count: int = 0
+	avoidance_only: bool = False
 
 	@property
 	def position_cm(self) -> Optional[tuple[float, float, float]]:
@@ -126,8 +133,14 @@ class YoloSquarePoseEstimator:
 		if self.outline_thickness_cm is None:
 			return False
 		if self.outline_class_id is None and self.outline_class_name is None:
-			return False
+			return class_name in {"partial_gate", "partinal_gate"}
 		return self._matches_class(class_id, class_name, names, self.outline_class_id, self.outline_class_name)
+
+	def _visible_corner_count(self, contour: np.ndarray) -> int:
+		contour_float = np.asarray(contour, dtype=np.float32)
+		if len(contour_float) < 4:
+			return int(len(contour_float))
+		return 4 if contour_to_square_corners(contour_float) is not None else 3
 
 	def _extract_candidate_contours(self, result) -> list[tuple[np.ndarray, float, Optional[int], Optional[str]]]:
 		"""Extract contours from an Ultralytics result or a mask-like object."""
@@ -193,17 +206,7 @@ class YoloSquarePoseEstimator:
 		return candidates
 
 	def _estimate_pose(self, corners_px: np.ndarray) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-		half_width = self.target_width_cm / 2.0
-		half_height = self.target_height_cm / 2.0
-		object_points = np.array(
-			[
-				[-half_width, -half_height, 0.0],
-				[half_width, -half_height, 0.0],
-				[half_width, half_height, 0.0],
-				[-half_width, half_height, 0.0],
-			],
-			dtype=np.float32,
-		)
+		object_points = self._object_corners_3d()
 
 		image_points = np.asarray(corners_px, dtype=np.float32).reshape(4, 2)
 		ok, rvec, tvec = cv2.solvePnP(
@@ -216,6 +219,175 @@ class YoloSquarePoseEstimator:
 		if not ok:
 			return None, None
 		return rvec, tvec
+
+	def _object_corners_3d(self) -> np.ndarray:
+		half_width = self.target_width_cm / 2.0
+		half_height = self.target_height_cm / 2.0
+		return np.array(
+			[
+				[-half_width, -half_height, 0.0],
+				[half_width, -half_height, 0.0],
+				[half_width, half_height, 0.0],
+				[-half_width, half_height, 0.0],
+			],
+			dtype=np.float32,
+		)
+
+	def _project_corners(self, rvec: np.ndarray, tvec: np.ndarray) -> Optional[np.ndarray]:
+		projected, _ = cv2.projectPoints(
+			self._object_corners_3d(),
+			rvec,
+			tvec,
+			self.camera_matrix,
+			self.dist_coeffs,
+		)
+		projected = np.asarray(projected, dtype=np.float32).reshape(4, 2)
+		if not np.all(np.isfinite(projected)):
+			return None
+		return order_points(projected)
+
+	def _corners_from_reference_fit(
+		self,
+		contour: np.ndarray,
+		reference_detection: SquarePoseDetection,
+	) -> Optional[np.ndarray]:
+		if reference_detection.rvec is None or reference_detection.tvec is None:
+			return None
+
+		reference_corners = self._project_corners(reference_detection.rvec, reference_detection.tvec)
+		if reference_corners is None:
+			return None
+
+		points = np.asarray(contour, dtype=np.float32).reshape(-1, 2)
+		if points.shape[0] < 8:
+			return None
+
+		edge_lines = []
+		for index in range(4):
+			line = line_from_points(reference_corners[index], reference_corners[(index + 1) % 4])
+			if line is None:
+				return None
+			edge_lines.append(line)
+
+		diagonal_px = float(np.linalg.norm(reference_corners[2] - reference_corners[0]))
+		fit_distance_px = max(6.0, min(28.0, diagonal_px * 0.045))
+		min_edge_points = max(8, min(24, points.shape[0] // 18))
+		fitted_lines = []
+		for line in edge_lines:
+			distances = line_distances(points, line)
+			near_points = points[distances <= fit_distance_px]
+			if near_points.shape[0] >= min_edge_points:
+				fitted_line = fit_line_tls(near_points)
+				fitted_lines.append(fitted_line if fitted_line is not None else line)
+			else:
+				fitted_lines.append(line)
+
+		intersections = []
+		for index in range(4):
+			point = line_intersection(fitted_lines[index - 1], fitted_lines[index])
+			if point is None or not np.all(np.isfinite(point)):
+				return None
+			intersections.append(point)
+
+		corners = order_points(np.asarray(intersections, dtype=np.float32))
+		contour_area = abs(float(cv2.contourArea(np.asarray(contour, dtype=np.float32).reshape(-1, 1, 2))))
+		corner_area = abs(float(cv2.contourArea(corners.reshape(-1, 1, 2))))
+		reference_area = abs(float(cv2.contourArea(reference_corners.reshape(-1, 1, 2))))
+		if corner_area <= 1.0 or contour_area <= 1.0 or reference_area <= 1.0:
+			return None
+		if corner_area < contour_area * 0.25 or corner_area > reference_area * 3.0:
+			return None
+		return corners
+
+	def refine_detection_with_reference(
+		self,
+		detection: SquarePoseDetection,
+		reference_detection: Optional[SquarePoseDetection],
+	) -> SquarePoseDetection:
+		if reference_detection is None:
+			return detection
+		if detection.avoidance_only or detection.pose_method.startswith("outline"):
+			return detection
+
+		corners_px = self._corners_from_reference_fit(detection.contour, reference_detection)
+		if corners_px is None:
+			return detection
+
+		rvec, tvec = self._estimate_pose(corners_px)
+		if tvec is None:
+			return detection
+
+		pose_confidence = max(
+			detection.pose_confidence,
+			self._pose_confidence(
+				pose_method="pnp_refit_prev",
+				detection_confidence=detection.confidence,
+				area_px=detection.area_px,
+				has_pose=True,
+			) * 0.88,
+		)
+		return replace(
+			detection,
+			corners_px=corners_px,
+			rvec=rvec,
+			tvec=tvec,
+			pose_method="pnp_refit_prev",
+			pose_confidence=pose_confidence,
+		)
+
+	def refine_detections_with_reference(
+		self,
+		detections: list[SquarePoseDetection],
+		reference_detection: Optional[SquarePoseDetection],
+	) -> list[SquarePoseDetection]:
+		if reference_detection is None:
+			return detections
+		return [self.refine_detection_with_reference(detection, reference_detection) for detection in detections]
+
+	def _detection_from_reference_fit(
+		self,
+		contour: np.ndarray,
+		confidence: float,
+		class_id: Optional[int],
+		class_name: Optional[str],
+		reference_detection: SquarePoseDetection,
+	) -> Optional[SquarePoseDetection]:
+		contour_area = float(cv2.contourArea(contour))
+		if contour_area < self.min_area_px:
+			return None
+
+		corners_px = self._corners_from_reference_fit(contour, reference_detection)
+		if corners_px is None:
+			return None
+
+		rvec, tvec = self._estimate_pose(corners_px)
+		if tvec is None:
+			return None
+
+		center_px = contour_center(contour)
+		score = contour_area * max(float(confidence), 1e-6)
+		pose_confidence = self._pose_confidence(
+			pose_method="pnp_refit_prev",
+			detection_confidence=float(confidence),
+			area_px=contour_area,
+			has_pose=True,
+		)
+		return SquarePoseDetection(
+			center_px=center_px,
+			corners_px=corners_px,
+			contour=np.asarray(contour, dtype=np.float32),
+			area_px=contour_area,
+			confidence=float(confidence),
+			score=float(score),
+			rvec=rvec,
+			tvec=tvec,
+			class_id=class_id,
+			class_name=class_name,
+			pose_method="pnp_refit_prev",
+			pose_confidence=pose_confidence,
+			corner_count=self._visible_corner_count(contour),
+			avoidance_only=False,
+		)
 
 	def _estimate_pose_from_outline(
 		self,
@@ -256,24 +428,28 @@ class YoloSquarePoseEstimator:
 
 		area_quality = min(1.0, max(0.0, area_px / max(self.min_area_px * 8.0, 1.0)))
 		det_quality = min(1.0, max(0.0, detection_confidence))
-		method_weight = 1.0 if pose_method == "pnp" else 0.28
+		method_weight = 1.0 if pose_method == "pnp" else 0.82 if pose_method == "pnp_refit_prev" else 0.28
 		quality = (0.35 + 0.65 * det_quality) * (0.35 + 0.65 * area_quality)
 		return float(min(1.0, method_weight * quality))
 
-	def estimate_from_result(self, result) -> Optional[SquarePoseDetection]:
-		"""Estimate the best square detection from a YOLO result object."""
+	def estimate_all_from_result(
+		self,
+		result,
+		reference_detection: Optional[SquarePoseDetection] = None,
+	) -> list[SquarePoseDetection]:
+		"""Estimate every usable gate/partial-gate candidate from a YOLO result object."""
 
 		if isinstance(result, (list, tuple)):
 			if not result:
-				return None
+				return []
 			result = result[0]
 
 		candidates = self._extract_candidate_contours(result)
 		if not candidates:
-			return None
+			return []
 
 		names = getattr(result, "names", None)
-		best_detection: Optional[SquarePoseDetection] = None
+		detections: list[SquarePoseDetection] = []
 
 		for contour, confidence, class_id, class_name in candidates:
 			is_outline = self._outline_class_matches(class_id, class_name, names)
@@ -286,10 +462,25 @@ class YoloSquarePoseEstimator:
 
 			corners_px = contour_to_square_corners(contour)
 			if corners_px is None:
+				if reference_detection is not None and not is_outline:
+					refit_detection = self._detection_from_reference_fit(
+						contour=contour,
+						confidence=float(confidence),
+						class_id=class_id,
+						class_name=class_name,
+						reference_detection=reference_detection,
+					)
+					if refit_detection is not None:
+						detections.append(refit_detection)
 				continue
 
 			center_px = contour_center(contour)
-			if is_outline:
+			corner_count = self._visible_corner_count(contour)
+			avoidance_only = bool(is_outline and corner_count <= 3)
+			if avoidance_only:
+				rvec, tvec, thickness_px = None, None, None
+				pose_method = "partial_avoidance"
+			elif is_outline:
 				rvec, tvec, thickness_px = self._estimate_pose_from_outline(contour, center_px)
 				pose_method = "outline_thickness"
 			else:
@@ -318,12 +509,22 @@ class YoloSquarePoseEstimator:
 				pose_method=pose_method,
 				thickness_px=thickness_px,
 				pose_confidence=pose_confidence,
+				corner_count=corner_count,
+				avoidance_only=avoidance_only,
 			)
 
-			if best_detection is None or detection.score > best_detection.score:
-				best_detection = detection
+			detections.append(detection)
 
-		return best_detection
+		detections.sort(key=lambda detection: detection.score, reverse=True)
+		return detections
+
+	def estimate_from_result(self, result) -> Optional[SquarePoseDetection]:
+		"""Estimate the best non-avoidance square detection from a YOLO result object."""
+
+		for detection in self.estimate_all_from_result(result):
+			if not detection.avoidance_only and detection.tvec is not None:
+				return detection
+		return None
 
 	def draw_detection(self, frame: np.ndarray, detection: SquarePoseDetection) -> np.ndarray:
 		"""Draw the detection on a frame and return the annotated image."""
