@@ -196,21 +196,27 @@ def corners_from_lines(lines: list[np.ndarray], contour_points: np.ndarray) -> O
 
 
 def contour_to_square_corners(contour: np.ndarray) -> Optional[np.ndarray]:
-	"""Estimate four corners from a contour."""
+	"""Estimate four corners from all available contour vertices."""
 
 	if contour is None or len(contour) < 4:
 		return None
 
 	contour_float = np.asarray(contour, dtype=np.float32)
+	points = contour_float.reshape(-1, 2)
+	lines = ransac_contour_lines(points)
+	corners = corners_from_lines(lines, points)
+	if corners is not None:
+		return corners
+
 	perimeter = cv2.arcLength(contour_float, True)
 	approx = cv2.approxPolyDP(contour_float, 0.02 * perimeter, True)
 
 	if len(approx) == 4 and cv2.isContourConvex(approx):
 		return order_points(approx.reshape(-1, 2))
 
-	points = contour_float.reshape(-1, 2)
-	lines = ransac_contour_lines(points)
-	return corners_from_lines(lines, points)
+	rect = cv2.minAreaRect(contour_float)
+	box = cv2.boxPoints(rect)
+	return order_points(box)
 
 
 def contours_from_mask(mask: np.ndarray, output_shape: Optional[tuple[int, int]] = None) -> list[np.ndarray]:
@@ -226,7 +232,7 @@ def contours_from_mask(mask: np.ndarray, output_shape: Optional[tuple[int, int]]
 			interpolation=cv2.INTER_NEAREST,
 		)
 
-	contours, _hierarchy = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+	contours, _hierarchy = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
 	contours = [contour for contour in contours if cv2.contourArea(contour) > 0]
 	contours.sort(key=cv2.contourArea, reverse=True)
 	return contours
