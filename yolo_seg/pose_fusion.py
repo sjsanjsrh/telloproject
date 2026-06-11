@@ -12,6 +12,27 @@ from yolo_seg.world_pose import CameraWorldPose, yaw_rotation_matrix_z
 
 GOOD_SLAM_STATES = {"OK", "TRACKING"}
 
+COMMAND_SPEED_MIN_CM_S = 1.0
+COMMAND_TRACKER_DEFAULT_SPEED_CM_S = 50.0
+COMMAND_DEFAULT_NOISE_CM = 45.0
+
+FUSION_PROCESS_NOISE = 25.0
+FUSION_INITIAL_POSITION_NOISE = 2500.0
+FUSION_INITIAL_VELOCITY_NOISE = 10000.0
+FUSION_DT_MIN_SEC = 1e-3
+FUSION_DT_MAX_SEC = 0.5
+
+PNP_MIN_CONFIDENCE = 0.22
+PNP_NOISE_HIGH_CM = 280.0
+PNP_NOISE_LOW_CM = 60.0
+
+SLAM_DELTA_MAX_CM = 150.0
+SLAM_DT_MIN_SEC = 1e-3
+SLAM_DT_MAX_SEC = 0.5
+SLAM_VELOCITY_NOISE_CM_S = 180.0
+
+PATH_PRIOR_NOISE_CM = 450.0
+
 
 @dataclass
 class FusedPose:
@@ -29,9 +50,9 @@ class CommandPose:
 class CommandPoseTracker:
 	"""Interpolate the expected command pose along flight path points."""
 
-	def __init__(self, flight_path_points: list[dict], speed_cm_s: float = 50.0, start_index: int = 0):
+	def __init__(self, flight_path_points: list[dict], speed_cm_s: float = COMMAND_TRACKER_DEFAULT_SPEED_CM_S, start_index: int = 0):
 		self.points = list(flight_path_points or [])
-		self.speed_cm_s = max(1.0, float(speed_cm_s))
+		self.speed_cm_s = max(COMMAND_SPEED_MIN_CM_S, float(speed_cm_s))
 		self.start_index = max(0, int(start_index))
 		self.start_time: Optional[float] = None
 		self._segments = self._build_segments()
@@ -46,7 +67,9 @@ class CommandPoseTracker:
 			end = positions[index + 1]
 			delta = end - start
 			length = float(np.linalg.norm(delta))
-			segments.append((index, start, end, delta, length))
+			start_yaw_deg = float(self.points[index].get("yaw_deg", 0.0))
+			end_yaw_deg = float(self.points[index + 1].get("yaw_deg", start_yaw_deg))
+			segments.append((index, start, end, delta, length, start_yaw_deg, end_yaw_deg))
 		return segments
 
 	def current_pose(self, timestamp: float) -> Optional[CommandPose]:
@@ -57,20 +80,22 @@ class CommandPoseTracker:
 
 		if not self._segments:
 			position = np.asarray(self.points[0]["position_cm"], dtype=np.float64).reshape(3)
+			yaw_deg = float(self.points[0].get("yaw_deg", 0.0))
 			return CommandPose(
-				camera_world_pose=CameraWorldPose(tuple(float(value) for value in position), np.eye(3), "command:start"),
+				camera_world_pose=CameraWorldPose(tuple(float(value) for value in position), yaw_rotation_matrix_z(yaw_deg), "command:start"),
 				status="command start",
 				segment_index=0,
 			)
 
 		remaining = max(0.0, float(timestamp) - self.start_time) * self.speed_cm_s
-		for index, start, end, delta, length in self._segments[self.start_index :]:
+		for index, start, end, delta, length, start_yaw_deg, end_yaw_deg in self._segments[self.start_index :]:
 			if length <= 1e-6:
 				continue
 			if remaining <= length:
 				t = remaining / length
 				position = start + delta * t
-				yaw_deg = float(np.degrees(np.arctan2(delta[1], delta[0]))) if np.linalg.norm(delta[:2]) > 1e-6 else 0.0
+				yaw_delta = ((end_yaw_deg - start_yaw_deg + 180.0) % 360.0) - 180.0
+				yaw_deg = start_yaw_deg + yaw_delta * t
 				return CommandPose(
 					camera_world_pose=CameraWorldPose(
 						position_cm=tuple(float(value) for value in position),
@@ -83,8 +108,9 @@ class CommandPoseTracker:
 			remaining -= length
 
 		position = np.asarray(self.points[-1]["position_cm"], dtype=np.float64).reshape(3)
+		yaw_deg = float(self.points[-1].get("yaw_deg", 0.0))
 		return CommandPose(
-			camera_world_pose=CameraWorldPose(tuple(float(value) for value in position), np.eye(3), "command:end"),
+			camera_world_pose=CameraWorldPose(tuple(float(value) for value in position), yaw_rotation_matrix_z(yaw_deg), "command:end"),
 			status="command end",
 			segment_index=len(self._segments) - 1,
 		)
@@ -95,9 +121,12 @@ class PoseFusion:
 
 	def __init__(
 		self,
-		process_noise: float = 25.0,
-		initial_position_noise: float = 2500.0,
-		initial_velocity_noise: float = 10000.0,
+		process_noise: float = FUSION_PROCESS_NOISE,
+		initial_position_noise: float = FUSION_INITIAL_POSITION_NOISE,
+		initial_velocity_noise: float = FUSION_INITIAL_VELOCITY_NOISE,
+		pnp_min_confidence: float = PNP_MIN_CONFIDENCE,
+		pnp_noise_high_cm: float = PNP_NOISE_HIGH_CM,
+		pnp_noise_low_cm: float = PNP_NOISE_LOW_CM,
 	):
 		self.x = np.zeros((6, 1), dtype=np.float64)
 		self.P = np.diag(
@@ -111,6 +140,9 @@ class PoseFusion:
 			]
 		).astype(np.float64)
 		self.process_noise = float(process_noise)
+		self.pnp_min_confidence = float(pnp_min_confidence)
+		self.pnp_noise_high_cm = float(pnp_noise_high_cm)
+		self.pnp_noise_low_cm = float(pnp_noise_low_cm)
 		self.initialized = False
 		self.last_time: Optional[float] = None
 		self.last_slam_pose: Optional[SlamPose] = None
@@ -123,7 +155,7 @@ class PoseFusion:
 			self.last_time = float(timestamp)
 			return 0.0
 
-		dt = max(1e-3, min(0.5, float(timestamp) - self.last_time))
+		dt = max(FUSION_DT_MIN_SEC, min(FUSION_DT_MAX_SEC, float(timestamp) - self.last_time))
 		self.last_time = float(timestamp)
 		F = np.eye(6, dtype=np.float64)
 		F[0, 3] = dt
@@ -173,7 +205,7 @@ class PoseFusion:
 		pnp_pose: Optional[CameraWorldPose],
 		pnp_confidence: float = 0.0,
 		command_pose: Optional[CameraWorldPose] = None,
-		command_noise_cm: float = 45.0,
+		command_noise_cm: float = COMMAND_DEFAULT_NOISE_CM,
 		flight_path_points: Optional[list[dict]] = None,
 		timestamp: Optional[float] = None,
 	) -> Optional[FusedPose]:
@@ -184,13 +216,16 @@ class PoseFusion:
 			now = time.time()
 		dt = self.predict(now)
 		parts: list[str] = []
+		rotation_source = None
+		pnp_rotation_candidate = None
 
 		if command_pose is not None:
 			command_position = np.asarray(command_pose.position_cm, dtype=np.float64).reshape(3)
+			self.last_rotation = np.asarray(command_pose.rotation_matrix, dtype=np.float64).reshape(3, 3)
+			rotation_source = "cmd rot"
 			if not self.initialized:
 				self.x[:3, 0] = command_position
 				self.x[3:, 0] = 0.0
-				self.last_rotation = np.asarray(command_pose.rotation_matrix, dtype=np.float64).reshape(3, 3)
 				self.initialized = True
 				parts.append("cmd init")
 			else:
@@ -198,40 +233,58 @@ class PoseFusion:
 				parts.append("cmd")
 
 		if pnp_pose is not None:
-			self.last_rotation = np.asarray(pnp_pose.rotation_matrix, dtype=np.float64).reshape(3, 3)
 			pnp_position = np.asarray(pnp_pose.position_cm, dtype=np.float64).reshape(3)
-			if not self.initialized:
+			if not self.initialized and pnp_confidence >= self.pnp_min_confidence:
+				pnp_rotation_candidate = np.asarray(pnp_pose.rotation_matrix, dtype=np.float64).reshape(3, 3)
 				self.x[:3, 0] = pnp_position
 				self.x[3:, 0] = 0.0
 				self.initialized = True
 				parts.append("pnp init")
-			elif pnp_confidence >= 0.15:
-				noise = float(np.interp(np.clip(pnp_confidence, 0.15, 1.0), [0.15, 1.0], [120.0, 25.0]))
+			elif pnp_confidence >= self.pnp_min_confidence:
+				pnp_rotation_candidate = np.asarray(pnp_pose.rotation_matrix, dtype=np.float64).reshape(3, 3)
+				noise = float(
+					np.interp(
+						np.clip(pnp_confidence, self.pnp_min_confidence, 1.0),
+						[self.pnp_min_confidence, 1.0],
+						[self.pnp_noise_high_cm, self.pnp_noise_low_cm],
+					)
+				)
 				self.update_position(pnp_position, noise_cm=noise)
 				parts.append("pnp")
+			else:
+				parts.append("pnp reject")
 
 		if slam_pose is not None:
 			state = slam_pose.tracking_state.upper()
 			if state in GOOD_SLAM_STATES and self.initialized:
+				if rotation_source is None:
+					self.last_rotation = np.asarray(slam_pose.rotation_matrix, dtype=np.float64).reshape(3, 3)
+					rotation_source = "slam rot"
 				if self.last_slam_pose is not None and self.last_slam_time is not None and dt > 1e-3:
 					current = np.asarray(slam_pose.position_cm, dtype=np.float64).reshape(3)
 					previous = np.asarray(self.last_slam_pose.position_cm, dtype=np.float64).reshape(3)
-					slam_dt = max(1e-3, min(0.5, float(slam_pose.timestamp) - self.last_slam_time))
+					slam_dt = max(SLAM_DT_MIN_SEC, min(SLAM_DT_MAX_SEC, float(slam_pose.timestamp) - self.last_slam_time))
 					delta = current - previous
-					if float(np.linalg.norm(delta)) < 150.0:
-						self.update_velocity(delta / slam_dt, noise_cm_s=180.0)
+					if float(np.linalg.norm(delta)) < SLAM_DELTA_MAX_CM:
+						self.update_velocity(delta / slam_dt, noise_cm_s=SLAM_VELOCITY_NOISE_CM_S)
 						parts.append("slam d")
 				self.last_slam_pose = slam_pose
 				self.last_slam_time = float(slam_pose.timestamp)
 			else:
-				self.reset_slam_anchor()
+				parts.append("slam hold")
 		else:
-			self.reset_slam_anchor()
+			parts.append("slam hold")
+
+		if rotation_source is None and pnp_rotation_candidate is not None:
+			self.last_rotation = pnp_rotation_candidate
+			rotation_source = "pnp rot"
+		if rotation_source is not None:
+			parts.append(rotation_source)
 
 		if self.initialized and flight_path_points:
 			path_projection = nearest_path_point(flight_path_points, self.x[:3, 0])
 			if path_projection is not None:
-				self.update_position(path_projection["position_cm"], noise_cm=450.0)
+				self.update_position(path_projection["position_cm"], noise_cm=PATH_PRIOR_NOISE_CM)
 				parts.append("path")
 
 		if not self.initialized:

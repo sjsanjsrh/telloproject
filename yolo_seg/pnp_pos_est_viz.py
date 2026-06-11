@@ -43,7 +43,7 @@ from yolo_seg.pose_fusion import CommandPoseTracker, PoseFusion
 from yolo_seg.scene_map import Obstacle, SceneMap, load_scene_map
 from yolo_seg.scene_3d_viz import create_scene_3d_visualizer
 from yolo_seg.slam_backend import SlamPose, create_slam_backend
-from yolo_seg.world_pose import CameraWorldPose, estimate_camera_world_pose
+from yolo_seg.world_pose import CameraWorldPose, TELLO_TO_OPENCV, estimate_camera_world_pose, yaw_rotation_matrix_z
 
 
 DEFAULT_MODEL = "yolo_seg/res/runs/segment/train/weights/best.pt"
@@ -51,6 +51,30 @@ DEFAULT_CAMERA_PARAMS = Path("camera_calibration") / "camera_params.yaml"
 DEFAULT_SCENE_MAP = Path("yolo_seg") / "obstacles.yaml"
 DEFAULT_FLIGHT_PLAN = Path("flight_path.yaml")
 DEFAULT_SQUARE_SIZE_CM = 20.0
+
+PNP_PRIOR_HEIGHT_WEIGHT = 0.35
+PNP_SLAM_HEIGHT_WEIGHT = 0.15
+PNP_SLAM_IMAGE_Y_WEIGHT = 0.35
+
+PNP_PROJECTION_MIN_FORWARD_CM = 1.0
+PNP_PROJECTION_BASE_SCORE = -80.0
+PNP_PROJECTION_INSIDE_SCORE = 160.0
+PNP_PROJECTION_FULL_INSIDE_BONUS = 60.0
+PNP_PROJECTION_CENTER_ERROR_MAX_FULL = 0.18
+PNP_PROJECTION_CENTER_ERROR_MAX_PARTIAL = 0.28
+PNP_PROJECTION_CENTER_PENALTY = 180.0
+PNP_PROJECTION_SIZE_ERROR_MAX_FULL = 0.70
+PNP_PROJECTION_SIZE_ERROR_MAX_PARTIAL = 1.05
+PNP_PROJECTION_SIZE_PENALTY = 70.0
+
+PNP_SCORE_POSE_CONFIDENCE_WEIGHT = 1000.0
+PNP_SCORE_DETECTION_CONFIDENCE_WEIGHT = 100.0
+PNP_SCORE_COMMAND_POSITION_WEIGHT = 0.035
+PNP_SCORE_LAST_POSITION_WEIGHT = 0.025
+PNP_SCORE_SLAM_POSITION_WEIGHT = 0.01
+PNP_SCORE_OUTLINE_THICKNESS_PENALTY = 120.0
+
+PARTIAL_GATE_MIN_OFFSET_NORM = 0.06
 
 
 def parse_args() -> argparse.Namespace:
@@ -586,6 +610,172 @@ def resolve_obstacle(
 	return scene_map.match_detection(detection.class_id, detection.class_name)
 
 
+def obstacle_world_corners(obstacle: Obstacle) -> np.ndarray:
+	half_width = float(obstacle.shape.width_cm) / 2.0
+	half_height = float(obstacle.shape.height_cm) / 2.0
+	local = np.array(
+		[
+			[0.0, -half_width, -half_height],
+			[0.0, half_width, -half_height],
+			[0.0, half_width, half_height],
+			[0.0, -half_width, half_height],
+		],
+		dtype=np.float64,
+	)
+	rotation = yaw_rotation_matrix_z(obstacle.yaw_deg)
+	center = np.asarray(obstacle.position_cm, dtype=np.float64).reshape(3)
+	return (rotation @ local.T).T + center
+
+
+def projection_score_from_pose(
+	detection: SquarePoseDetection,
+	obstacle: Optional[Obstacle],
+	camera_pose: Optional[CameraWorldPose],
+	camera_matrix: Optional[np.ndarray],
+	dist_coeffs: Optional[np.ndarray],
+) -> Optional[float]:
+	if obstacle is None or camera_pose is None or camera_matrix is None:
+		return 0.0
+
+	world_corners = obstacle_world_corners(obstacle)
+	camera_position = np.asarray(camera_pose.position_cm, dtype=np.float64).reshape(3)
+	world_to_camera_tello = np.asarray(camera_pose.rotation_matrix, dtype=np.float64).reshape(3, 3).T
+	local_tello = (world_to_camera_tello @ (world_corners - camera_position).T).T
+	local_opencv = (TELLO_TO_OPENCV @ local_tello.T).T
+	forward = local_opencv[:, 2]
+	if np.any(forward <= PNP_PROJECTION_MIN_FORWARD_CM):
+		return None
+
+	projected, _ = cv2.projectPoints(
+		local_opencv.astype(np.float64),
+		np.zeros((3, 1), dtype=np.float64),
+		np.zeros((3, 1), dtype=np.float64),
+		np.asarray(camera_matrix, dtype=np.float64),
+		None if dist_coeffs is None else np.asarray(dist_coeffs, dtype=np.float64).reshape(-1, 1),
+	)
+	projected = np.asarray(projected, dtype=np.float64).reshape(-1, 2)
+	if not np.all(np.isfinite(projected)):
+		return None
+
+	image_width = max(1.0, float(camera_matrix[0, 2]) * 2.0)
+	image_height = max(1.0, float(camera_matrix[1, 2]) * 2.0)
+	inside_x = (projected[:, 0] >= 0.0) & (projected[:, 0] <= image_width)
+	inside_y = (projected[:, 1] >= 0.0) & (projected[:, 1] <= image_height)
+	inside_ratio = float(np.mean(inside_x & inside_y))
+
+	pred_min = np.min(projected, axis=0)
+	pred_max = np.max(projected, axis=0)
+	intersects = pred_max[0] >= 0.0 and pred_min[0] <= image_width and pred_max[1] >= 0.0 and pred_min[1] <= image_height
+	if not intersects:
+		return None
+
+	score = PNP_PROJECTION_BASE_SCORE + inside_ratio * PNP_PROJECTION_INSIDE_SCORE
+	if inside_ratio >= 1.0:
+		score += PNP_PROJECTION_FULL_INSIDE_BONUS
+
+	pred_center = np.mean(projected, axis=0)
+	det_center = np.asarray(detection.center_px, dtype=np.float64).reshape(2)
+	image_diag = max(1.0, float(np.hypot(image_width, image_height)))
+	center_delta = pred_center - det_center
+	image_y_weight = PNP_SLAM_IMAGE_Y_WEIGHT if "slam" in camera_pose.method.lower() or "orb" in camera_pose.method.lower() else 1.0
+	center_delta[1] *= image_y_weight
+	center_error = float(np.linalg.norm(center_delta) / image_diag)
+	max_center_error = PNP_PROJECTION_CENTER_ERROR_MAX_FULL if inside_ratio >= 1.0 else PNP_PROJECTION_CENTER_ERROR_MAX_PARTIAL
+	if center_error > max_center_error:
+		return None
+	score -= min(1.0, center_error) * PNP_PROJECTION_CENTER_PENALTY
+
+	det_corners = np.asarray(detection.corners_px, dtype=np.float64).reshape(-1, 2)
+	det_size = np.maximum(np.max(det_corners, axis=0) - np.min(det_corners, axis=0), 1.0)
+	pred_size = np.maximum(pred_max - pred_min, 1.0)
+	size_error = abs(float(np.log((pred_size[0] * pred_size[1]) / max(1.0, det_size[0] * det_size[1]))))
+	max_size_error = PNP_PROJECTION_SIZE_ERROR_MAX_FULL if inside_ratio >= 1.0 else PNP_PROJECTION_SIZE_ERROR_MAX_PARTIAL
+	if size_error > max_size_error:
+		return None
+	score -= min(1.0, size_error) * PNP_PROJECTION_SIZE_PENALTY
+	return float(score)
+
+
+def projected_obstacle_bbox(
+	obstacle: Optional[Obstacle],
+	camera_pose: Optional[CameraWorldPose],
+	camera_matrix: Optional[np.ndarray],
+	dist_coeffs: Optional[np.ndarray],
+) -> Optional[tuple[np.ndarray, np.ndarray, tuple[float, float]]]:
+	if obstacle is None or camera_pose is None or camera_matrix is None:
+		return None
+
+	world_corners = obstacle_world_corners(obstacle)
+	camera_position = np.asarray(camera_pose.position_cm, dtype=np.float64).reshape(3)
+	world_to_camera_tello = np.asarray(camera_pose.rotation_matrix, dtype=np.float64).reshape(3, 3).T
+	local_tello = (world_to_camera_tello @ (world_corners - camera_position).T).T
+	local_opencv = (TELLO_TO_OPENCV @ local_tello.T).T
+	if np.any(local_opencv[:, 2] <= PNP_PROJECTION_MIN_FORWARD_CM):
+		return None
+
+	projected, _ = cv2.projectPoints(
+		local_opencv.astype(np.float64),
+		np.zeros((3, 1), dtype=np.float64),
+		np.zeros((3, 1), dtype=np.float64),
+		np.asarray(camera_matrix, dtype=np.float64),
+		None if dist_coeffs is None else np.asarray(dist_coeffs, dtype=np.float64).reshape(-1, 1),
+	)
+	projected = np.asarray(projected, dtype=np.float64).reshape(-1, 2)
+	if not np.all(np.isfinite(projected)):
+		return None
+
+	return np.min(projected, axis=0), np.max(projected, axis=0), (float(camera_matrix[0, 2]) * 2.0, float(camera_matrix[1, 2]) * 2.0)
+
+
+def partial_gate_cue_from_projection(
+	detections: list[SquarePoseDetection],
+	obstacle: Optional[Obstacle],
+	camera_pose: Optional[CameraWorldPose],
+	camera_matrix: Optional[np.ndarray],
+	dist_coeffs: Optional[np.ndarray],
+) -> Optional[dict]:
+	projected_bbox = projected_obstacle_bbox(obstacle, camera_pose, camera_matrix, dist_coeffs)
+	if projected_bbox is None:
+		return None
+
+	pred_min, pred_max, image_size = projected_bbox
+	image_width, image_height = image_size
+	image_diag = max(1.0, float(np.hypot(image_width, image_height)))
+	pred_center = (pred_min + pred_max) * 0.5
+	best = None
+	for detection in detections:
+		if not detection.avoidance_only:
+			continue
+		contour = np.asarray(detection.contour, dtype=np.float64).reshape(-1, 2)
+		if contour.size == 0:
+			continue
+		det_min = np.min(contour, axis=0)
+		det_max = np.max(contour, axis=0)
+		det_center = (det_min + det_max) * 0.5
+		offset_px = det_center - pred_center
+		offset_norm = float(np.linalg.norm(offset_px) / image_diag)
+		if offset_norm < PARTIAL_GATE_MIN_OFFSET_NORM:
+			continue
+		horizontal = "target right / drone left" if offset_px[0] > 0.0 else "target left / drone right"
+		vertical = "target down / drone high" if offset_px[1] > 0.0 else "target up / drone low"
+		cue = {
+			"detection": detection,
+			"offset_px": (float(offset_px[0]), float(offset_px[1])),
+			"offset_norm": offset_norm,
+			"horizontal": horizontal,
+			"vertical": vertical,
+		}
+		if best is None or offset_norm > best["offset_norm"]:
+			best = cue
+	return best
+
+
+def weighted_position_error_cm(position_a, position_b, height_weight: float = 1.0) -> float:
+	delta = np.asarray(position_a, dtype=np.float64).reshape(3) - np.asarray(position_b, dtype=np.float64).reshape(3)
+	delta[2] *= float(height_weight)
+	return float(np.linalg.norm(delta))
+
+
 def select_pose_detection(
 	detections: list[SquarePoseDetection],
 	scene_map: Optional[SceneMap],
@@ -596,8 +786,11 @@ def select_pose_detection(
 	command_pose: Optional[CameraWorldPose],
 	last_camera_world_pose: Optional[CameraWorldPose],
 	slam_pose: Optional[SlamPose],
+	camera_matrix: Optional[np.ndarray] = None,
+	dist_coeffs: Optional[np.ndarray] = None,
 ) -> tuple[Optional[SquarePoseDetection], Optional[Obstacle], Optional[CameraWorldPose]]:
 	best: tuple[float, Optional[SquarePoseDetection], Optional[Obstacle], Optional[CameraWorldPose]] = (-float("inf"), None, None, None)
+	projection_pose = last_camera_world_pose or command_pose or (slam_pose.camera_world_pose if slam_pose is not None else None)
 	for detection in detections:
 		if detection.avoidance_only or detection.tvec is None:
 			continue
@@ -613,15 +806,25 @@ def select_pose_detection(
 			continue
 
 		position = np.asarray(camera_world_pose.position_cm, dtype=np.float64)
-		score = detection.pose_confidence * 1000.0 + detection.confidence * 100.0
+		score = detection.pose_confidence * PNP_SCORE_POSE_CONFIDENCE_WEIGHT + detection.confidence * PNP_SCORE_DETECTION_CONFIDENCE_WEIGHT
 		if command_pose is not None:
-			score -= 0.035 * float(np.linalg.norm(position - np.asarray(command_pose.position_cm, dtype=np.float64)))
+			score -= PNP_SCORE_COMMAND_POSITION_WEIGHT * weighted_position_error_cm(position, command_pose.position_cm, height_weight=PNP_PRIOR_HEIGHT_WEIGHT)
 		if last_camera_world_pose is not None:
-			score -= 0.025 * float(np.linalg.norm(position - np.asarray(last_camera_world_pose.position_cm, dtype=np.float64)))
+			score -= PNP_SCORE_LAST_POSITION_WEIGHT * weighted_position_error_cm(position, last_camera_world_pose.position_cm, height_weight=PNP_PRIOR_HEIGHT_WEIGHT)
 		if slam_pose is not None:
-			score -= 0.01 * float(np.linalg.norm(position - np.asarray(slam_pose.position_cm, dtype=np.float64)))
+			score -= PNP_SCORE_SLAM_POSITION_WEIGHT * weighted_position_error_cm(position, slam_pose.position_cm, height_weight=PNP_SLAM_HEIGHT_WEIGHT)
 		if detection.pose_method == "outline_thickness":
-			score -= 120.0
+			score -= PNP_SCORE_OUTLINE_THICKNESS_PENALTY
+		projection_score = projection_score_from_pose(
+			detection=detection,
+			obstacle=obstacle,
+			camera_pose=projection_pose,
+			camera_matrix=camera_matrix,
+			dist_coeffs=dist_coeffs,
+		)
+		if projection_score is None:
+			continue
+		score += projection_score
 
 		if score > best[0]:
 			best = (score, detection, obstacle, camera_world_pose)
@@ -825,11 +1028,18 @@ def build_horizontal_dashboard(
 	yolo_fps: float = 0.0,
 	slam_fps: float = 0.0,
 	vision_frame: Optional[np.ndarray] = None,
+	fusion_status: Optional[str] = None,
+	pnp_applied: bool = False,
+	partial_gate_cue: Optional[dict] = None,
 ) -> np.ndarray:
 	vision_frame = frame if vision_frame is None else vision_frame
 	original_panel = resize_to_height(frame, panel_height)
 	plot_panel = resize_to_fit_height(build_outline_overlay(vision_frame, result), panel_height) if result is not None else resize_to_height(vision_frame, panel_height)
 	pose_panel = resize_to_height(add_detection_info(vision_frame, detection, detections), panel_height)
+	if pnp_applied:
+		cv2.putText(pose_panel, "PNP APPLIED", (18, pose_panel.shape[0] - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (80, 255, 80), 2, cv2.LINE_AA)
+	elif detection is not None:
+		cv2.putText(pose_panel, "PNP DETECTED / NOT FUSED", (18, pose_panel.shape[0] - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 200, 255), 2, cv2.LINE_AA)
 
 	if detection is None:
 		status_lines = [
@@ -853,6 +1063,15 @@ def build_horizontal_dashboard(
 		]
 	if slam_status:
 		status_lines.append(f"slam: {slam_status}")
+	if fusion_status:
+		pnp_text = "APPLIED" if pnp_applied else "not fused"
+		status_lines.append(f"fusion: {fusion_status}   pnp: {pnp_text}")
+	if partial_gate_cue is not None:
+		offset_x, offset_y = partial_gate_cue["offset_px"]
+		status_lines.append(
+			f"partial gate: {partial_gate_cue['horizontal']}, {partial_gate_cue['vertical']} "
+			f"offset=({offset_x:.0f},{offset_y:.0f})px norm={partial_gate_cue['offset_norm']:.2f}"
+		)
 
 	image_strip = np.hstack([original_panel, plot_panel, pose_panel])
 	info_panel = make_text_panel(image_strip.shape[1], status_lines)
@@ -1017,6 +1236,8 @@ def main() -> None:
 					command_pose=command_pose,
 					last_camera_world_pose=last_camera_world_pose,
 					slam_pose=slam_pose,
+					camera_matrix=camera_matrix,
+					dist_coeffs=dist_coeffs,
 				)
 
 			result = last_result
@@ -1024,6 +1245,7 @@ def main() -> None:
 			detection = last_detection
 			detection_obstacle = last_detection_obstacle
 			reference_obstacle = detection_obstacle or config_obstacle
+			partial_gate_obstacle = reference_obstacle or resolve_obstacle(scene_map, args.object_id, None)
 			dashboard_object_position_cm = object_position_cm
 			dashboard_object_yaw_deg = object_yaw_deg
 			if args.object_position_cm is None and reference_obstacle is not None:
@@ -1041,12 +1263,21 @@ def main() -> None:
 				pnp_confidence=detection.pose_confidence if new_yolo_measurement and detection is not None else 0.0,
 				command_pose=command_pose,
 				command_noise_cm=args.command_noise_cm,
-				flight_path_points=flight_path_points,
+				flight_path_points=flight_path_points if args.command_prior else None,
 				timestamp=now,
 			)
 			if fused_result is not None:
 				fused_pose = fused_result.camera_world_pose
 				path_projection = nearest_path_point(flight_path_points, fused_pose.position_cm)
+			fusion_status = fused_result.status if fused_result is not None else None
+			pnp_applied = fusion_status is not None and any(part in {"pnp", "pnp init"} for part in fusion_status.split("+"))
+			partial_gate_cue = partial_gate_cue_from_projection(
+				detections=detections,
+				obstacle=partial_gate_obstacle,
+				camera_pose=command_pose or fused_pose or (slam_pose.camera_world_pose if slam_pose is not None else None),
+				camera_matrix=camera_matrix,
+				dist_coeffs=dist_coeffs,
+			)
 			postprocess_ms = (perf_counter() - postprocess_start) * 1000.0
 			dashboard = build_horizontal_dashboard(
 				frame=frame,
@@ -1066,6 +1297,9 @@ def main() -> None:
 				yolo_fps=last_yolo_fps,
 				slam_fps=current_slam_fps,
 				vision_frame=last_yolo_frame,
+				fusion_status=fusion_status,
+				pnp_applied=pnp_applied,
+				partial_gate_cue=partial_gate_cue,
 			)
 
 			frame_end = perf_counter()
