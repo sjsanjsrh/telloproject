@@ -162,6 +162,31 @@ def fill_mask_holes(mask: np.ndarray) -> np.ndarray:
     return filled
 
 
+def remove_small_holes(mask: np.ndarray, min_area_ratio: float) -> np.ndarray:
+    if min_area_ratio <= 0:
+        return mask
+
+    binary = np.asarray(mask > 0, dtype=np.uint8) * 255
+    height, width = binary.shape[:2]
+    min_area = max(1, int(height * width * min_area_ratio))
+
+    flood = binary.copy()
+    flood_mask = np.zeros((height + 2, width + 2), dtype=np.uint8)
+    cv2.floodFill(flood, flood_mask, (0, 0), 255)
+
+    background = flood
+    holes = cv2.bitwise_not(background)
+    holes = cv2.bitwise_and(holes, cv2.bitwise_not(binary))
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(holes, connectivity=8)
+    cleaned = binary.copy()
+    for label_id in range(1, num_labels):
+        area = int(stats[label_id, cv2.CC_STAT_AREA])
+        if area < min_area:
+            cleaned[labels == label_id] = 255
+    return cleaned
+
+
 def remove_small_components(mask: np.ndarray, min_area_ratio: float) -> np.ndarray:
     if min_area_ratio <= 0:
         return mask
@@ -318,6 +343,7 @@ def split_label_studio_masks(
                 if should_fill_result_holes(result, fill_labels):
                     object_mask = fill_mask_holes(object_mask)
                 object_mask = remove_small_components(object_mask, min_component_area_ratio)
+                object_mask = remove_small_holes(object_mask, min_component_area_ratio)
                 bbox = mask_to_bbox(object_mask)
                 if bbox is None:
                     continue
@@ -341,6 +367,7 @@ def split_label_studio_masks(
                 if should_fill_result_holes(result, fill_labels):
                     object_mask = fill_mask_holes(object_mask)
                 object_mask = remove_small_components(object_mask, min_component_area_ratio)
+                object_mask = remove_small_holes(object_mask, min_component_area_ratio)
                 mask = object_mask if mask is None else cv2.bitwise_or(mask, object_mask)
 
             if mask is None or not np.any(mask):
@@ -350,6 +377,8 @@ def split_label_studio_masks(
                     continue
                 mask = np.zeros(image.shape[:2], dtype=np.uint8)
                 report["empty_masks"].append({"task_id": task.get("id"), "image": output_name})
+            else:
+                mask = remove_small_holes(mask, min_component_area_ratio)
 
             cv2.imwrite(str(out_dir / "masks" / split_name / f"{output_stem}.png"), mask)
             report[split_name]["masks"] += 1

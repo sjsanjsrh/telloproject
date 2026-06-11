@@ -4,18 +4,35 @@ import argparse
 import json
 import random
 import re
+import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+CURRENT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = CURRENT_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from yolo_seg.prepare_coco import split_label_studio_masks
+
+PROJECT_ROOT = CURRENT_DIR
 MASK_ROOT_CANDIDATES = (
     PROJECT_ROOT / "res" / "data_masks",
     PROJECT_ROOT / "data_masks",
 )
+IMAGE_ROOT_CANDIDATES = (
+    PROJECT_ROOT / "data",
+)
+LABEL_STUDIO_JSON_CANDIDATES = (
+    PROJECT_ROOT / "data",
+    PROJECT_ROOT,
+)
 OUT_PATH = PROJECT_ROOT / "res" / "dataset_preview.png"
+PREPROCESSED_MASK_ROOT = PROJECT_ROOT / "res" / "data_masks"
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+DEFAULT_FILL_LABELS = {"full_gate"}
 PALETTE = (
     (40, 220, 80),
     (40, 160, 255),
@@ -28,7 +45,11 @@ PALETTE = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Visualize mask PNG dataset samples.")
-    parser.add_argument("--root", default="", help="mask dataset root. Defaults to yolo_seg/res/data_masks if present")
+    parser.add_argument(
+        "--root",
+        default="",
+        help="dataset root. Defaults to yolo_seg/res/data_masks for mask datasets, otherwise yolo_seg/data for image-only datasets",
+    )
     parser.add_argument("--filter", default="", help="only visualize images whose file name contains this text")
     parser.add_argument("--filter-regex", default="", help="only visualize images whose file name matches this regex")
     parser.add_argument("--out", default=str(OUT_PATH), help="output preview image path")
@@ -39,11 +60,44 @@ def parse_args() -> argparse.Namespace:
 def find_mask_root(root_arg: str) -> Path | None:
     if root_arg:
         root = Path(root_arg)
-        return root if root.exists() else None
+        if root.exists() and (root / "images").exists() and (root / "masks").exists():
+            return root
+        return None
 
     for root in MASK_ROOT_CANDIDATES:
         if (root / "images").exists() and (root / "masks").exists():
             return root
+    return None
+
+
+def find_image_root(root_arg: str) -> Path | None:
+    if root_arg:
+        root = Path(root_arg)
+        return root if root.exists() else None
+
+    for root in IMAGE_ROOT_CANDIDATES:
+        if root.exists():
+            return root
+    return None
+
+
+def find_label_studio_json(root_arg: str) -> Path | None:
+    if root_arg:
+        root = Path(root_arg)
+        if root.is_file() and root.suffix.lower() == ".json" and root.exists():
+            return root
+        if root.is_dir():
+            json_files = sorted(root.glob("*.json"))
+            if json_files:
+                return json_files[0]
+        return None
+
+    for root in LABEL_STUDIO_JSON_CANDIDATES:
+        if not root.exists():
+            continue
+        json_files = sorted(root.glob("*.json"))
+        if json_files:
+            return json_files[0]
     return None
 
 
@@ -56,7 +110,7 @@ def load_split_annotations(root: Path, split_name: str) -> dict[str, list[dict]]
     return {item.get("image", ""): item.get("objects", []) for item in annotations}
 
 
-def collect_samples(root: Path) -> tuple[list[tuple[Path, Path, str, list[dict]]], list[tuple[Path, str]]]:
+def collect_mask_samples(root: Path) -> tuple[list[tuple[Path, Path, str, list[dict]]], list[tuple[Path, str]]]:
     samples: list[tuple[Path, Path, str, list[dict]]] = []
     missing_masks: list[tuple[Path, str]] = []
 
@@ -79,6 +133,32 @@ def collect_samples(root: Path) -> tuple[list[tuple[Path, Path, str, list[dict]]
                 missing_masks.append((image_path, "missing mask"))
 
     return samples, missing_masks
+
+
+def collect_image_samples(root: Path) -> tuple[list[tuple[Path, None, str, list[dict]]], list[tuple[Path, str]]]:
+    samples: list[tuple[Path, None, str, list[dict]]] = []
+    skipped: list[tuple[Path, str]] = []
+
+    def has_images(directory: Path) -> bool:
+        return any(directory.glob(f"*{ext}") for ext in IMAGE_EXTENSIONS)
+
+    image_dirs = [path for path in root.rglob("*") if path.is_dir() and has_images(path)]
+    if not image_dirs and any(root.glob(f"*{ext}")):
+        image_dirs = [root]
+
+    for image_dir in sorted(set(image_dirs)):
+        split_name = image_dir.relative_to(root).parts[0] if image_dir != root and image_dir.relative_to(root).parts else root.name
+        images: list[Path] = []
+        for ext in IMAGE_EXTENSIONS:
+            images.extend(image_dir.glob(f"*{ext}"))
+
+        for image_path in sorted(images):
+            samples.append((image_path, None, split_name, []))
+
+    if not samples:
+        skipped.append((root, "no images found"))
+
+    return samples, skipped
 
 
 def draw_box_label(output: np.ndarray, bbox: list[int], label: str, color: tuple[int, int, int]) -> None:
@@ -122,7 +202,13 @@ def color_for_object(obj: dict) -> tuple[int, int, int]:
     return PALETTE[class_id % len(PALETTE)]
 
 
-def draw_overlay(image: np.ndarray, mask: np.ndarray, split_name: str, objects: list[dict], root: Path) -> np.ndarray:
+def draw_overlay(
+    image: np.ndarray,
+    mask: np.ndarray | None,
+    split_name: str,
+    objects: list[dict],
+    root: Path,
+) -> np.ndarray:
     output = image.copy()
 
     if objects:
@@ -131,10 +217,9 @@ def draw_overlay(image: np.ndarray, mask: np.ndarray, split_name: str, objects: 
             object_mask_name = obj.get("mask", "")
             object_mask_path = root / "object_masks" / split_name / object_mask_name
             object_mask = cv2.imread(str(object_mask_path), cv2.IMREAD_GRAYSCALE) if object_mask_name else None
-            if object_mask is None:
-                object_mask = mask
-            blend_object_mask(output, object_mask, color)
-    else:
+            if object_mask is not None:
+                blend_object_mask(output, object_mask, color)
+    elif mask is not None:
         blend_object_mask(output, mask, PALETTE[0])
 
     cv2.putText(output, f"{split_name}: {image.shape[1]}x{image.shape[0]}", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
@@ -148,12 +233,36 @@ def draw_overlay(image: np.ndarray, mask: np.ndarray, split_name: str, objects: 
 
 def main() -> None:
     args = parse_args()
+    mode = "mask"
     root = find_mask_root(args.root)
-    if root is None:
-        candidates = ", ".join(str(candidate) for candidate in MASK_ROOT_CANDIDATES)
-        raise RuntimeError(f"No mask dataset found. Checked: {candidates}")
+    if root is not None:
+        samples, missing_items = collect_mask_samples(root)
+    else:
+        root = find_image_root(args.root)
+        if root is None:
+            mask_candidates = ", ".join(str(candidate) for candidate in MASK_ROOT_CANDIDATES)
+            image_candidates = ", ".join(str(candidate) for candidate in IMAGE_ROOT_CANDIDATES)
+            raise RuntimeError(f"No dataset found. Checked mask roots: {mask_candidates}; image roots: {image_candidates}")
 
-    samples, missing_items = collect_samples(root)
+        json_path = find_label_studio_json(args.root) or find_label_studio_json(str(root))
+        if json_path is not None:
+            print(f"preparing mask dataset from: {json_path}")
+            split_label_studio_masks(
+                json_path,
+                root,
+                PREPROCESSED_MASK_ROOT,
+                split=0.8,
+                seed=42,
+                fill_labels=DEFAULT_FILL_LABELS,
+                min_component_area_ratio=0.0005,
+            )
+            root = PREPROCESSED_MASK_ROOT
+            mode = "preprocessed-mask"
+            samples, missing_items = collect_mask_samples(root)
+        else:
+            mode = "image"
+            samples, missing_items = collect_image_samples(root)
+
     if args.filter:
         samples = [sample for sample in samples if args.filter in sample[0].name]
     if args.filter_regex:
@@ -162,7 +271,7 @@ def main() -> None:
     if not samples:
         raise RuntimeError("No readable mask samples found")
 
-    print(f"mode: mask")
+    print(f"mode: {mode}")
     print(f"root: {root}")
     print(f"found {len(samples)} samples")
     print(f"missing items: {len(missing_items)}")
@@ -176,8 +285,8 @@ def main() -> None:
     tiles = []
     for image_path, mask_path, split_name, objects in samples:
         image = cv2.imread(str(image_path))
-        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-        if image is None or mask is None:
+        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE) if mask_path is not None else None
+        if image is None or (mask_path is not None and mask is None):
             continue
 
         overlay = draw_overlay(image, mask, split_name, objects, root)

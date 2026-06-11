@@ -40,11 +40,23 @@ def resolve_output_path(path_text: str) -> Path:
     return CURRENT_DIR / candidate
 
 
+def find_label_studio_json(image_root: Path) -> Path | None:
+    candidates = []
+    for base_dir in (image_root, CURRENT_DIR / 'data', CURRENT_DIR):
+        if base_dir.exists():
+            candidates.extend(sorted(base_dir.glob('*.json'), key=lambda path: path.stat().st_mtime, reverse=True))
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--args-yaml', default=str(ARGS_YAML), help='YOLO hyperparameter YAML path')
     p.add_argument('--model', default='yolo26n-seg.pt', help='initial YOLO model/weights path')
-    p.add_argument('--data', default='yolo_seg/data/project-2-at-2026-06-09-03-33-803af9b1.json', help='Label Studio JSON or ready Ultralytics data.yaml path')
+    p.add_argument('--data', default='', help='Label Studio JSON or ready Ultralytics data.yaml path. Leave empty to auto-detect a JSON export from the images root.')
     p.add_argument('--images', default='yolo_seg/data', help='source image root for Label Studio local-files paths')
     p.add_argument('--out', default='yolo_seg/res/data_masks', help='output folder for mask PNG/NumPy dataset')
     p.add_argument('--split', type=float, default=0.8, help='train split ratio when preparing masks')
@@ -66,10 +78,14 @@ def main():
         raise ValueError('--workers must be 0 or greater')
 
     args_yaml_path = resolve_cli_path(args.args_yaml, must_exist=False)
-    data_source = resolve_cli_path(args.data, must_exist=True)
+    images_path = resolve_cli_path(args.images, must_exist=True)
+    data_source = resolve_cli_path(args.data, must_exist=True) if args.data else None
+    if data_source is None:
+        data_source = find_label_studio_json(images_path)
+        if data_source is None:
+            raise FileNotFoundError(f'No JSON export found. Looked in: {images_path}, {CURRENT_DIR / "data"}, {CURRENT_DIR}')
 
     if data_source.suffix.lower() == '.json':
-        images_path = resolve_cli_path(args.images, must_exist=True)
         out_path = resolve_output_path(args.out)
         print('Preparing object-mask YOLO dataset: json=', data_source, ' images=', images_path, ' out=', out_path)
         fill_labels = set(args.fill_label)
