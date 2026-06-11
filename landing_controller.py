@@ -15,17 +15,17 @@ from telloController import TelloController
 @dataclass
 class LandingConfig:
 	camera_params_path: str = "camera_calibration/camera_params.yaml"
-	white_threshold: int = 250
+	white_threshold: int = 200
 	white_threshold_contour: int = 150
-	ellipse_area_ratio_range: tuple[float, float] = (0.6, 1.4)
-	ellipse_aspect_ratio_threshold: float = 1.35
+	ellipse_area_ratio_range: tuple[float, float] = (0.85, 1.15)
+	ellipse_aspect_ratio_threshold: float = 1.1
 	ellipse_size_threshold: float = 50.0
-	target_error_threshold: float = 0.15
-	target_error_threshold_contour: float = 0.025
-	contour_height_cm: int = 50
-	hold_time_sec: float = 0.6
+	target_error_threshold: float = 0.1
+	target_error_threshold_contour: float = 0.07
+	contour_height_cm: int = 60
+	hold_time_sec: float = 0.4
 	descent_step_cm: int = 50
-	descent_speed: int = 50
+	descent_speed: int = 100
 	window_name: str = "show_frame"
 
 
@@ -117,7 +117,7 @@ class LandingController:
 		pid.init_dt()
 
 		while self.tracking_mode != "land":
-			height = max(self.tello.get_height(), 20)
+			height = max(self.tello.get_height(), self.config.contour_height_cm)
 			if height <= self.config.contour_height_cm:
 				self.tracking_mode = "contour"
 			print(f"current height: {height}cm")

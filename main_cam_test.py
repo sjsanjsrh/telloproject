@@ -10,12 +10,15 @@ def main():
 	landing = LandingController(
 		tello,
 		LandingConfig(
-			white_threshold=250,
-			white_threshold_contour=170,
+			white_threshold=200,
+			white_threshold_contour=150,
+			ellipse_area_ratio_range=(0.85, 1.15),
+			ellipse_aspect_ratio_threshold=1.1,
 			target_error_threshold=0.1,
-			target_error_threshold_contour=0.05,
-			contour_height_cm=30,
+			target_error_threshold_contour=0.07,
+			contour_height_cm=60,
 			hold_time_sec=0.4,
+			descent_speed=100,
 		),
 	)
 
