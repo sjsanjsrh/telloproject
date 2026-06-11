@@ -162,6 +162,14 @@ class TelloController(Tello):
             return
         self.set_video_direction(direction)
 
+    def switchVideoProcessing(self, show_video=False, camera_direction=None, frame_callback=None):
+        self.__frame_callback = frame_callback
+        self.__show_video = show_video
+        with self.__lock:
+            self.__frame = None
+        if camera_direction is not None:
+            self.switch_video_direction(camera_direction)
+
     # __setupVideo thread processing warper
     def setUpVideo(self, show_video = False, camera_direction=Tello.CAMERA_FORWARD, frame_callback=None):
         self.__frame_callback = frame_callback

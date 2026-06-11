@@ -10,7 +10,7 @@ def main():
 	landing = LandingController(
 		tello,
 		LandingConfig(
-			white_threshold=200,
+			white_threshold=250,
 			white_threshold_contour=150,
 			ellipse_area_ratio_range=(0.85, 1.15),
 			ellipse_aspect_ratio_threshold=1.1,
@@ -39,7 +39,7 @@ def main():
 		tello.takeoff()
 		height = tello.get_height()
 		print(f"current height: {height}cm")
-		tello.go_xyz_speed(0, 0, 120 - height, 100)
+		tello.go_xyz_speed(0, 0, 150 - height, 100)
 		landing.run()
 	except KeyboardInterrupt:
 		print("program stopped")

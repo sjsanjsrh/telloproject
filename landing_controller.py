@@ -15,15 +15,17 @@ from telloController import TelloController
 @dataclass
 class LandingConfig:
 	camera_params_path: str = "camera_calibration/camera_params.yaml"
-	white_threshold: int = 200
-	white_threshold_contour: int = 150
+	white_threshold: int = 230
+	# white_threshold_contour: int = 150
+	white_threshold_contour: int = 200
 	ellipse_area_ratio_range: tuple[float, float] = (0.85, 1.15)
 	ellipse_aspect_ratio_threshold: float = 1.1
 	ellipse_size_threshold: float = 50.0
 	target_error_threshold: float = 0.1
-	target_error_threshold_contour: float = 0.07
+	target_error_threshold_contour: float = 0.05
 	contour_height_cm: int = 60
-	hold_time_sec: float = 0.4
+	hold_time_sec: float = 0.2
+	hold_time_sec_contour: float = 0.6
 	descent_step_cm: int = 50
 	descent_speed: int = 100
 	window_name: str = "show_frame"
@@ -57,6 +59,7 @@ class LandingController:
 
 	def frame_callback(self, frame) -> None:
 		target = None
+		self.target_point = None
 		white_threshold = self.config.white_threshold
 		if self.tracking_mode == "contour":
 			white_threshold = self.config.white_threshold_contour
@@ -106,6 +109,7 @@ class LandingController:
 		cv2.drawContours(show_frame, contours, -1, (255, 0, 0), 1)
 		cv2.putText(show_frame, self.tracking_mode, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 		cv2.imshow(self.config.window_name, show_frame)
+		cv2.waitKey(1)
 
 	def run(self) -> None:
 		print("landing start")
@@ -117,12 +121,18 @@ class LandingController:
 		pid.init_dt()
 
 		while self.tracking_mode != "land":
+			hold_time_sec = self.config.hold_time_sec_contour if self.tracking_mode == "contour" else self.config.hold_time_sec
 			height = max(self.tello.get_height(), self.config.contour_height_cm)
-			if height <= self.config.contour_height_cm:
+			if self.tracking_mode == "ellipse" and height <= self.config.contour_height_cm:
 				self.tracking_mode = "contour"
+				hold_time_sec = self.config.hold_time_sec_contour
+				current_hold_time = hold_time_sec
+				pid.reset()
+				pid.init_dt()
 			print(f"current height: {height}cm")
 
 			if self.target_point is None:
+				current_hold_time = hold_time_sec
 				time.sleep(0.001)
 				continue
 
@@ -140,7 +150,7 @@ class LandingController:
 				else self.config.target_error_threshold_contour
 			)
 			if error > threshold:
-				current_hold_time = self.config.hold_time_sec
+				current_hold_time = hold_time_sec
 				print(f"landing target: ({x_cm:.2f}, {y_cm:.2f}) cm, error={error:.2f}")
 				pid.control_position(x_cm, y_cm, dt=dt)
 			else:
@@ -153,6 +163,7 @@ class LandingController:
 					self.tello.go_xyz_speed(0, 0, -abs(self.config.descent_step_cm), self.config.descent_speed)
 					pid.reset()
 					pid.init_dt()
+					current_hold_time = self.config.hold_time_sec
 				else:
 					self.tello.land()
 					pid.reset()

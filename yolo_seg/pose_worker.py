@@ -22,6 +22,8 @@ from yolo_seg.pnp_pos_est_viz import (
 	first_obstacle,
 	load_optional_scene_map,
 	parse_vector3,
+	partial_gate_cue_from_projection,
+	resolve_obstacle,
 	select_pose_detection,
 )
 from yolo_seg.pose_fusion import CommandPose, PoseFusion
@@ -247,28 +249,42 @@ class TelloPoseWorker:
 					command_pose=command_pose,
 					last_camera_world_pose=last_camera_world_pose,
 					slam_pose=slam_pose,
+					camera_matrix=camera_matrix,
+					dist_coeffs=dist_coeffs,
 				)
 				last_detections = detections
 				last_selected_detection = selected_detection
 				if vision_pose is not None:
 					last_vision_pose = vision_pose
-			pose_confidence = selected_detection.pose_confidence if new_yolo_measurement and selected_detection is not None else 0.0
+			pose_confidence = selected_detection.pose_confidence if selected_detection is not None else 0.0
+			disable_pnp_fusion = getattr(args, "disable_pnp_fusion", False)
+			fusion_pnp_pose = None if getattr(args, "disable_pnp_fusion", False) else vision_pose
+			fusion_pnp_confidence = 0.0 if getattr(args, "disable_pnp_fusion", False) or not new_yolo_measurement else pose_confidence
 			fused = fusion.update(
 				slam_pose=slam_pose,
-				pnp_pose=vision_pose,
-				pnp_confidence=pose_confidence,
+				pnp_pose=fusion_pnp_pose,
+				pnp_confidence=fusion_pnp_confidence,
 				command_pose=command_pose,
 				command_noise_cm=args.command_noise_cm,
-				flight_path_points=flight_points,
+				flight_path_points=flight_points if args.command_prior else None,
 				timestamp=now,
 			)
 			fused_pose = fused.camera_world_pose if fused is not None else None
-			if vision_pose is not None:
+			if vision_pose is not None and not disable_pnp_fusion:
 				last_camera_world_pose = vision_pose
 			elif fused_pose is not None:
 				last_camera_world_pose = fused_pose
 
 			status = fused.status if fused is not None else slam_status
+			pnp_applied = fused is not None and any(part in {"pnp", "pnp init"} for part in fused.status.split("+"))
+			partial_gate_obstacle = config_obstacle or resolve_obstacle(scene_map, getattr(args, "object_id", None), None)
+			partial_gate_cue = partial_gate_cue_from_projection(
+				detections=detections,
+				obstacle=partial_gate_obstacle,
+				camera_pose=command_pose or fused_pose or (slam_pose.camera_world_pose if slam_pose is not None else None),
+				camera_matrix=camera_matrix,
+				dist_coeffs=dist_coeffs,
+			)
 			self._set_latest(
 				PoseWorkerResult(
 					timestamp=now,
@@ -283,10 +299,16 @@ class TelloPoseWorker:
 			)
 
 			path_projection = nearest_path_point(flight_points, fused_pose.position_cm) if fused_pose is not None else None
+			visible_camera_pose = (
+				fused_pose
+				or (slam_pose.camera_world_pose if slam_pose is not None else None)
+				or command_pose
+				or (None if disable_pnp_fusion else vision_pose)
+			)
 			if scene_3d is not None:
 				scene_3d.show(
 					scene_map=scene_map,
-					camera_pose=fused_pose or vision_pose,
+					camera_pose=visible_camera_pose,
 					flight_path_points=flight_points,
 					pose_markers=build_pose_markers(
 						vision_pose,
@@ -317,6 +339,9 @@ class TelloPoseWorker:
 					yolo_fps=last_yolo_fps,
 					slam_fps=slam_pump.fps(),
 					vision_frame=last_yolo_frame,
+					fusion_status=status,
+					pnp_applied=pnp_applied,
+					partial_gate_cue=partial_gate_cue,
 				)
 				cv2.imshow(args.pose_window_name, dashboard)
 				cv2.waitKey(1)

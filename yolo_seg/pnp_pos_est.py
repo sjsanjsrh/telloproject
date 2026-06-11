@@ -33,6 +33,30 @@ from yolo_seg.geometry import (
 from yolo_seg.world_pose import opencv_to_tello_vector
 
 
+DEFAULT_MIN_AREA_PX = 200.0
+
+REFIT_MIN_CONTOUR_POINTS = 8
+REFIT_DISTANCE_MIN_PX = 6.0
+REFIT_DISTANCE_MAX_PX = 28.0
+REFIT_DISTANCE_DIAGONAL_RATIO = 0.045
+REFIT_EDGE_POINTS_MIN = 8
+REFIT_EDGE_POINTS_MAX = 24
+REFIT_EDGE_POINTS_DIVISOR = 18
+REFIT_AREA_EPS_PX = 1.0
+REFIT_CORNER_AREA_MIN_CONTOUR_RATIO = 0.25
+REFIT_CORNER_AREA_MAX_REFERENCE_RATIO = 3.0
+REFIT_CONFIDENCE_MULTIPLIER = 0.88
+
+DETECTION_SCORE_CONFIDENCE_FLOOR = 1e-6
+
+POSE_CONFIDENCE_AREA_MULTIPLIER = 4.0
+POSE_CONFIDENCE_PNP_WEIGHT = 1.0
+POSE_CONFIDENCE_REFIT_WEIGHT = 0.82
+POSE_CONFIDENCE_OUTLINE_WEIGHT = 0.35
+POSE_CONFIDENCE_BASE = 0.45
+POSE_CONFIDENCE_DYNAMIC = 0.55
+
+
 @dataclass
 class SquarePoseDetection:
 	"""Pose estimation result for one square target."""
@@ -83,7 +107,7 @@ class YoloSquarePoseEstimator:
 		outline_class_id: Optional[int] = None,
 		outline_class_name: Optional[str] = None,
 		outline_thickness_cm: Optional[float] = None,
-		min_area_px: float = 200.0,
+		min_area_px: float = DEFAULT_MIN_AREA_PX,
 	) -> None:
 		self.camera_matrix = np.asarray(camera_matrix, dtype=np.float64)
 		self.dist_coeffs = np.asarray(dist_coeffs, dtype=np.float64).reshape(-1, 1)
@@ -142,6 +166,74 @@ class YoloSquarePoseEstimator:
 			return int(len(contour_float))
 		return 4 if contour_to_square_corners(contour_float) is not None else 3
 
+	def _box_xyxy(self, boxes, index: int, output_shape: Optional[tuple[int, int]]) -> Optional[tuple[int, int, int, int]]:
+		if boxes is None or not hasattr(boxes, "xyxy") or len(boxes) <= index:
+			return None
+		box = boxes.xyxy[index]
+		if hasattr(box, "detach"):
+			box = box.detach().cpu().numpy()
+		elif hasattr(box, "tolist"):
+			box = box.tolist()
+		x1, y1, x2, y2 = [float(value) for value in np.asarray(box, dtype=np.float64).reshape(-1)[:4]]
+		if output_shape is not None:
+			height, width = output_shape
+			x1 = max(0.0, min(float(width - 1), x1))
+			x2 = max(0.0, min(float(width - 1), x2))
+			y1 = max(0.0, min(float(height - 1), y1))
+			y2 = max(0.0, min(float(height - 1), y2))
+		left = int(np.floor(min(x1, x2)))
+		top = int(np.floor(min(y1, y2)))
+		right = int(np.ceil(max(x1, x2)))
+		bottom = int(np.ceil(max(y1, y2)))
+		if right <= left or bottom <= top:
+			return None
+		return left, top, right, bottom
+
+	def _clip_mask_to_box(self, mask: np.ndarray, box_xyxy: Optional[tuple[int, int, int, int]], output_shape: Optional[tuple[int, int]]) -> np.ndarray:
+		binary_mask = (np.asarray(mask) > 0).astype(np.uint8)
+		if output_shape is not None and binary_mask.shape[:2] != output_shape:
+			binary_mask = cv2.resize(
+				binary_mask,
+				(output_shape[1], output_shape[0]),
+				interpolation=cv2.INTER_NEAREST,
+			)
+		if box_xyxy is None:
+			return binary_mask
+		left, top, right, bottom = box_xyxy
+		clipped = np.zeros_like(binary_mask, dtype=np.uint8)
+		clipped[top : bottom + 1, left : right + 1] = binary_mask[top : bottom + 1, left : right + 1]
+		return clipped
+
+	def _contours_from_polygon_in_box(
+		self,
+		polygon,
+		box_xyxy: Optional[tuple[int, int, int, int]],
+		output_shape: Optional[tuple[int, int]],
+	) -> list[np.ndarray]:
+		if output_shape is None:
+			contour = contour_from_polygon(polygon)
+			if box_xyxy is None:
+				return [contour]
+			left, top, right, bottom = box_xyxy
+			points = contour.reshape(-1, 2)
+			inside = (
+				(points[:, 0] >= left)
+				& (points[:, 0] <= right)
+				& (points[:, 1] >= top)
+				& (points[:, 1] <= bottom)
+			)
+			points = points[inside]
+			if points.shape[0] < 3:
+				return []
+			return [points.astype(np.float32).reshape(-1, 1, 2)]
+
+		mask = np.zeros(output_shape, dtype=np.uint8)
+		contour = np.rint(contour_from_polygon(polygon)).astype(np.int32)
+		if len(contour) >= 3:
+			cv2.fillPoly(mask, [contour], 1)
+		clipped = self._clip_mask_to_box(mask, box_xyxy, output_shape)
+		return contours_from_mask(clipped)
+
 	def _extract_candidate_contours(self, result) -> list[tuple[np.ndarray, float, Optional[int], Optional[str]]]:
 		"""Extract contours from an Ultralytics result or a mask-like object."""
 
@@ -156,7 +248,8 @@ class YoloSquarePoseEstimator:
 		if masks is not None and getattr(masks, "xy", None) is not None:
 			polygons = masks.xy
 			for index, polygon in enumerate(polygons):
-				contour = contour_from_polygon(polygon)
+				box_xyxy = self._box_xyxy(boxes, index, orig_shape)
+				contours = self._contours_from_polygon_in_box(polygon, box_xyxy, orig_shape)
 				confidence = 1.0
 				class_id = None
 				class_name = None
@@ -167,7 +260,8 @@ class YoloSquarePoseEstimator:
 					class_id = int(class_tensor.item() if hasattr(class_tensor, "item") else class_tensor)
 					if isinstance(names, dict):
 						class_name = names.get(class_id)
-				candidates.append((contour, confidence, class_id, class_name))
+				for contour in contours:
+					candidates.append((contour, confidence, class_id, class_name))
 			return candidates
 
 		mask_data = getattr(masks, "data", None) if masks is not None else None
@@ -181,13 +275,10 @@ class YoloSquarePoseEstimator:
 				mask_array = mask_array[np.newaxis, ...]
 
 			for index, mask in enumerate(mask_array):
-				contours = contours_from_mask(mask, output_shape=orig_shape)
-				if not contours:
-					continue
-
 				confidence = 1.0
 				class_id = None
 				class_name = None
+				box_xyxy = self._box_xyxy(boxes, index, orig_shape)
 				if boxes is not None and len(boxes) > index:
 					box_conf = boxes.conf[index]
 					confidence = float(box_conf.item() if hasattr(box_conf, "item") else box_conf)
@@ -195,6 +286,11 @@ class YoloSquarePoseEstimator:
 					class_id = int(class_tensor.item() if hasattr(class_tensor, "item") else class_tensor)
 					if isinstance(names, dict):
 						class_name = names.get(class_id)
+
+				clipped_mask = self._clip_mask_to_box(mask, box_xyxy, orig_shape)
+				contours = contours_from_mask(clipped_mask)
+				if not contours:
+					continue
 
 				for contour in contours:
 					candidates.append((contour, confidence, class_id, class_name))
@@ -259,7 +355,7 @@ class YoloSquarePoseEstimator:
 			return None
 
 		points = np.asarray(contour, dtype=np.float32).reshape(-1, 2)
-		if points.shape[0] < 8:
+		if points.shape[0] < REFIT_MIN_CONTOUR_POINTS:
 			return None
 
 		edge_lines = []
@@ -270,8 +366,8 @@ class YoloSquarePoseEstimator:
 			edge_lines.append(line)
 
 		diagonal_px = float(np.linalg.norm(reference_corners[2] - reference_corners[0]))
-		fit_distance_px = max(6.0, min(28.0, diagonal_px * 0.045))
-		min_edge_points = max(8, min(24, points.shape[0] // 18))
+		fit_distance_px = max(REFIT_DISTANCE_MIN_PX, min(REFIT_DISTANCE_MAX_PX, diagonal_px * REFIT_DISTANCE_DIAGONAL_RATIO))
+		min_edge_points = max(REFIT_EDGE_POINTS_MIN, min(REFIT_EDGE_POINTS_MAX, points.shape[0] // REFIT_EDGE_POINTS_DIVISOR))
 		fitted_lines = []
 		for line in edge_lines:
 			distances = line_distances(points, line)
@@ -293,9 +389,9 @@ class YoloSquarePoseEstimator:
 		contour_area = abs(float(cv2.contourArea(np.asarray(contour, dtype=np.float32).reshape(-1, 1, 2))))
 		corner_area = abs(float(cv2.contourArea(corners.reshape(-1, 1, 2))))
 		reference_area = abs(float(cv2.contourArea(reference_corners.reshape(-1, 1, 2))))
-		if corner_area <= 1.0 or contour_area <= 1.0 or reference_area <= 1.0:
+		if corner_area <= REFIT_AREA_EPS_PX or contour_area <= REFIT_AREA_EPS_PX or reference_area <= REFIT_AREA_EPS_PX:
 			return None
-		if corner_area < contour_area * 0.25 or corner_area > reference_area * 3.0:
+		if corner_area < contour_area * REFIT_CORNER_AREA_MIN_CONTOUR_RATIO or corner_area > reference_area * REFIT_CORNER_AREA_MAX_REFERENCE_RATIO:
 			return None
 		return corners
 
@@ -324,7 +420,7 @@ class YoloSquarePoseEstimator:
 				detection_confidence=detection.confidence,
 				area_px=detection.area_px,
 				has_pose=True,
-			) * 0.88,
+			) * REFIT_CONFIDENCE_MULTIPLIER,
 		)
 		return replace(
 			detection,
@@ -365,7 +461,7 @@ class YoloSquarePoseEstimator:
 			return None
 
 		center_px = contour_center(contour)
-		score = contour_area * max(float(confidence), 1e-6)
+		score = contour_area * max(float(confidence), DETECTION_SCORE_CONFIDENCE_FLOOR)
 		pose_confidence = self._pose_confidence(
 			pose_method="pnp_refit_prev",
 			detection_confidence=float(confidence),
@@ -426,10 +522,10 @@ class YoloSquarePoseEstimator:
 		if not has_pose:
 			return 0.0
 
-		area_quality = min(1.0, max(0.0, area_px / max(self.min_area_px * 8.0, 1.0)))
+		area_quality = min(1.0, max(0.0, area_px / max(self.min_area_px * POSE_CONFIDENCE_AREA_MULTIPLIER, 1.0)))
 		det_quality = min(1.0, max(0.0, detection_confidence))
-		method_weight = 1.0 if pose_method == "pnp" else 0.82 if pose_method == "pnp_refit_prev" else 0.28
-		quality = (0.35 + 0.65 * det_quality) * (0.35 + 0.65 * area_quality)
+		method_weight = POSE_CONFIDENCE_PNP_WEIGHT if pose_method == "pnp" else POSE_CONFIDENCE_REFIT_WEIGHT if pose_method == "pnp_refit_prev" else POSE_CONFIDENCE_OUTLINE_WEIGHT
+		quality = (POSE_CONFIDENCE_BASE + POSE_CONFIDENCE_DYNAMIC * det_quality) * (POSE_CONFIDENCE_BASE + POSE_CONFIDENCE_DYNAMIC * area_quality)
 		return float(min(1.0, method_weight * quality))
 
 	def estimate_all_from_result(
@@ -487,7 +583,7 @@ class YoloSquarePoseEstimator:
 				rvec, tvec = self._estimate_pose(corners_px)
 				thickness_px = None
 				pose_method = "pnp"
-			score = contour_area * max(confidence, 1e-6)
+			score = contour_area * max(confidence, DETECTION_SCORE_CONFIDENCE_FLOOR)
 			pose_confidence = self._pose_confidence(
 				pose_method=pose_method,
 				detection_confidence=float(confidence),
@@ -554,7 +650,7 @@ def estimate_square_pose_from_result(
 	outline_class_id: Optional[int] = None,
 	outline_class_name: Optional[str] = None,
 	outline_thickness_cm: Optional[float] = None,
-	min_area_px: float = 200.0,
+	min_area_px: float = DEFAULT_MIN_AREA_PX,
 ) -> Optional[SquarePoseDetection]:
 	"""Convenience wrapper for one-shot square pose estimation."""
 

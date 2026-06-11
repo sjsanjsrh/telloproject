@@ -34,6 +34,7 @@ def flight_plan_points(plan: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
 		{
 			"name": str(start.get("position_name", "start")),
 			"position_cm": tuple(float(value) for value in position),
+			"yaw_deg": float(yaw_deg),
 			"kind": "start",
 		}
 	]
@@ -45,6 +46,7 @@ def flight_plan_points(plan: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
 			{
 				"name": str(start.get("takeoff_name", "takeoff")),
 				"position_cm": tuple(float(value) for value in position),
+				"yaw_deg": float(yaw_deg),
 				"kind": "takeoff",
 			}
 		)
@@ -54,6 +56,7 @@ def flight_plan_points(plan: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
 			{
 				"name": str(start.get("takeoff_name", "takeoff")),
 				"position_cm": tuple(float(value) for value in position),
+				"yaw_deg": float(yaw_deg),
 				"kind": "takeoff",
 			}
 		)
@@ -65,25 +68,35 @@ def flight_plan_points(plan: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
 			{
 				"name": str(start.get("name", "hover")),
 				"position_cm": tuple(float(value) for value in position),
+				"yaw_deg": float(yaw_deg),
 				"kind": "waypoint",
 			}
 		)
 
 	if start.get("rotate_deg") is not None:
 		yaw_deg += float(start["rotate_deg"])
+		points.append(
+			{
+				"name": str(start.get("rotate_name", "start rotate")),
+				"position_cm": tuple(float(value) for value in position),
+				"yaw_deg": float(yaw_deg),
+				"kind": "rotate",
+			}
+		)
 
 	for index, step in enumerate(plan.get("waypoints", []), start=1):
 		name = str(step.get("name", f"waypoint {index}"))
 		if step.get("position_cm") is not None:
 			position = np.asarray(_float3(step["position_cm"], f"{name}.position_cm"), dtype=np.float64)
-			points.append({"name": name, "position_cm": tuple(float(value) for value in position), "kind": "waypoint"})
+			points.append({"name": name, "position_cm": tuple(float(value) for value in position), "yaw_deg": float(yaw_deg), "kind": "waypoint"})
 		elif step.get("move_cm") is not None:
 			move = np.asarray(_float3(step["move_cm"], f"{name}.move_cm"), dtype=np.float64)
 			position = position + yaw_rotation_matrix_z(yaw_deg) @ move
-			points.append({"name": name, "position_cm": tuple(float(value) for value in position), "kind": "waypoint"})
+			points.append({"name": name, "position_cm": tuple(float(value) for value in position), "yaw_deg": float(yaw_deg), "kind": "waypoint"})
 
 		if step.get("rotate_deg") is not None:
 			yaw_deg += float(step["rotate_deg"])
+			points.append({"name": name, "position_cm": tuple(float(value) for value in position), "yaw_deg": float(yaw_deg), "kind": "rotate"})
 
 	return points
 

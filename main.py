@@ -1,4 +1,5 @@
 from telloController import TelloController
+from threading import Thread
 import time
 import numpy as np
 from pathlib import Path
@@ -37,24 +38,26 @@ DISABLE_3D = False
 SCENE_3D_RENDERER = "gpu"
 
 COMMAND_PRIOR_ENABLED = True
-COMMAND_SPEED_CM_S = 50.0
-COMMAND_NOISE_CM = 45.0
+COMMAND_SPEED_CM_S = 18.0
+COMMAND_NOISE_CM = 700.0
 COMMAND_START_INDEX = 0
+DISABLE_PNP_FUSION = False
 
 SLAM_BACKEND = "orbslam3_py"
 SLAM_FPS = 20.0
-SLAM_SCALE_CM = 100.0
+SLAM_SCALE_CM = 200.0
 ORBSLAM3_VOCAB = "third_party/orbslam3_windows/ORB_SLAM3/Vocabulary/ORBvoc.txt"
 ORBSLAM3_SETTINGS = "yolo_seg/orbslam3_tello_forward_480p.yaml"
 ORBSLAM3_PY_MODULE = "third_party/orbslam3_py/orbslam3_py.cp310-win_amd64.pyd"
 
-WAYPOINT_CORRECTION_ENABLED = False
-APPLY_WAYPOINT_CORRECTION = False
+WAYPOINT_CORRECTION_ENABLED = True
+APPLY_WAYPOINT_CORRECTION = True
 CORRECTION_GAIN = 0.4
 MAX_CORRECTION_CM = 25.0
 MIN_CORRECTION_CONFIDENCE = 0.45
 POSE_MAX_AGE_SEC = 1.0
 POSE_WORKER_STARTUP_TIMEOUT_SEC = 120.0
+PRE_LANDING_VIDEO_STEP_NAME = "w4"
 
 DEFAULT_PLAN = {
     "speed": 50,
@@ -144,6 +147,7 @@ def make_pose_settings():
         command_speed_cm_s=COMMAND_SPEED_CM_S,
         command_noise_cm=COMMAND_NOISE_CM,
         command_start_index=COMMAND_START_INDEX,
+        disable_pnp_fusion=DISABLE_PNP_FUSION,
         slam_backend=SLAM_BACKEND,
         slam_fps=SLAM_FPS,
         slam_scale_cm=SLAM_SCALE_CM,
@@ -158,6 +162,41 @@ def make_pose_settings():
         min_correction_confidence=MIN_CORRECTION_CONFIDENCE,
         pose_max_age_sec=POSE_MAX_AGE_SEC,
     )
+
+
+def wait_for_frame_stream(tello, label: str = "camera", interval_sec: float = 0.2) -> None:
+    while not tello.can_read_frame():
+        print(f"{label}: waiting for frame...")
+        time.sleep(interval_sec)
+
+
+def preload_landing_video(tello, landing_controller, active_pose_worker=None):
+    global pose_worker
+    if active_pose_worker is not None:
+        Thread(target=active_pose_worker.stop, daemon=True).start()
+    pose_worker = None
+    print("preloading landing video")
+    tello.switchVideoProcessing(
+        show_video=False,
+        camera_direction=TelloController.CAMERA_DOWNWARD,
+        frame_callback=landing_controller.frame_callback,
+    )
+    return None
+
+
+def ensure_landing_video(tello, landing_controller, timeout_sec: float = 4.0):
+    print("ensuring landing video")
+    tello.switchVideoProcessing(
+        show_video=False,
+        camera_direction=TelloController.CAMERA_DOWNWARD,
+        frame_callback=landing_controller.frame_callback,
+    )
+    deadline = time.time() + float(timeout_sec)
+    while time.time() < deadline:
+        if tello.can_read_frame() and tello.get_frame() is not None:
+            return
+        print("landing video: waiting for frame...")
+        time.sleep(0.2)
 
 
 def load_flight_plan(path):
@@ -222,6 +261,32 @@ def publish_command_pose(pose_worker, flight_state, status: str, segment_index: 
     )
 
 
+def command_state_after_move(flight_state, move_cm):
+    if flight_state is None:
+        return None
+    move = np.asarray(move_cm, dtype=np.float64).reshape(3)
+    return {
+        "position_cm": flight_state["position_cm"] + yaw_rotation_matrix_z(flight_state["yaw_deg"]) @ move,
+        "yaw_deg": float(flight_state["yaw_deg"]),
+    }
+
+
+def command_state_after_rotate(flight_state, rotate_deg):
+    if flight_state is None:
+        return None
+    return {
+        "position_cm": np.asarray(flight_state["position_cm"], dtype=np.float64).reshape(3).copy(),
+        "yaw_deg": float(flight_state["yaw_deg"]) + float(rotate_deg),
+    }
+
+
+def apply_flight_state(flight_state, next_state):
+    if flight_state is None or next_state is None:
+        return
+    flight_state["position_cm"] = np.asarray(next_state["position_cm"], dtype=np.float64).reshape(3)
+    flight_state["yaw_deg"] = float(next_state["yaw_deg"])
+
+
 def execute_flight_step(tello, step, index=None, pose_worker=None, waypoint_corrector=None, flight_state=None, pose_max_age_sec=1.0):
     name = str(step.get("name", f"step {index}" if index is not None else "step"))
 
@@ -249,17 +314,21 @@ def execute_flight_step(tello, step, index=None, pose_worker=None, waypoint_corr
                 f"corr={tuple(round(v, 1) for v in correction.correction_local_cm)} "
                 f"move={correction.original_move_cm}->{correction.corrected_move_cm}"
             )
+        next_state = command_state_after_move(flight_state, (x, y, z))
+        publish_command_pose(pose_worker, next_state, f"{name} cmd", segment_index=index or 0)
         tello.go_xyz_speed(x, y, z, speed)
-        update_flight_state(flight_state, step)
+        apply_flight_state(flight_state, next_state)
         publish_command_pose(pose_worker, flight_state, f"{name} ack", segment_index=index or 0)
         print(f"{name} 이동 완료: x={x}, y={y}, z={z}, speed={speed}")
     elif step.get("rotate_deg") is not None:
         rotate_deg = int(step["rotate_deg"])
+        next_state = command_state_after_rotate(flight_state, rotate_deg)
+        publish_command_pose(pose_worker, next_state, f"{name} cmd", segment_index=index or 0)
         if rotate_deg >= 0:
             tello.rotate_clockwise(rotate_deg)
         else:
             tello.rotate_counter_clockwise(abs(rotate_deg))
-        update_flight_state(flight_state, step)
+        apply_flight_state(flight_state, next_state)
         publish_command_pose(pose_worker, flight_state, f"{name} ack", segment_index=index or 0)
         print(f"{name} 회전 완료: {rotate_deg}도")
     elif step.get("wait_sec") is not None:
@@ -272,7 +341,16 @@ def execute_flight_step(tello, step, index=None, pose_worker=None, waypoint_corr
         time.sleep(wait_sec)
 
 
-def execute_flight_plan(tello, plan, pose_worker=None, waypoint_corrector=None, pose_max_age_sec=1.0, takeoff_acknowledged=False):
+def execute_flight_plan(
+    tello,
+    plan,
+    pose_worker=None,
+    waypoint_corrector=None,
+    pose_max_age_sec=1.0,
+    takeoff_acknowledged=False,
+    landing_controller=None,
+    pre_landing_step_name=None,
+):
     flight_state = make_flight_state(plan)
     publish_command_pose(pose_worker, flight_state, "start", segment_index=0)
     if takeoff_acknowledged:
@@ -295,6 +373,13 @@ def execute_flight_plan(tello, plan, pose_worker=None, waypoint_corrector=None, 
         )
 
     for index, waypoint in enumerate(plan.get("waypoints", []), start=1):
+        if (
+            pre_landing_step_name is not None
+            and landing_controller is not None
+            and str(waypoint.get("name", f"waypoint {index}")) == str(pre_landing_step_name)
+        ):
+            pose_worker = preload_landing_video(tello, landing_controller, pose_worker)
+            pre_landing_step_name = None
         execute_flight_step(
             tello,
             waypoint,
@@ -320,28 +405,17 @@ def main():
     tello.set_video_resolution(tello.RESOLUTION_480P if CAMERA_RESOLUTION == 480 else tello.RESOLUTION_720P)
     if POSE_WORKER_ENABLED:
         camera_direction = TelloController.CAMERA_FORWARD if CAMERA_NAME == "forward" else TelloController.CAMERA_DOWNWARD
+        print(f"startup video: direction={camera_direction}, resolution={CAMERA_RESOLUTION}, pose_worker={POSE_WORKER_ENABLED}")
         tello.setUpVideo(show_video=False, camera_direction=camera_direction, frame_callback=None)
     else:
+        print(f"startup video: direction={TelloController.CAMERA_DOWNWARD}, resolution={CAMERA_RESOLUTION}, pose_worker={POSE_WORKER_ENABLED}")
         landing_controller.setup_video(show_video=True)
     tello.printInfo()
-    while not tello.can_read_frame():
-        time.sleep(0.1)
+    wait_for_frame_stream(tello, "startup video")
     print("드론 연결 성공")
     tello.set_speed(int(flight_plan.get("speed", 50)))
     if not tello.can_flight():
         return
-    
-    start_time = time.time()
-    
-    if POSE_WORKER_ENABLED:
-        pose_worker = TelloPoseWorker(tello, settings)
-        pose_worker.start()
-        print("waiting for pose backend...")
-        if not pose_worker.wait_ready(timeout=POSE_WORKER_STARTUP_TIMEOUT_SEC):
-            error = pose_worker.startup_error or "timeout"
-            pose_worker.stop()
-            raise RuntimeError(f"pose backend is not ready before takeoff: {error}")
-        print("pose backend ready")
     if WAYPOINT_CORRECTION_ENABLED:
         waypoint_corrector = WaypointCorrector(
             gain=CORRECTION_GAIN,
@@ -350,8 +424,15 @@ def main():
             dry_run=not APPLY_WAYPOINT_CORRECTION,
         )
 
+    input("이륙 준비 완료. 엔터 키를 눌러 이륙합니다...")
+    start_time = time.time()
     tello.takeoff()
     print("이륙 완료")
+    
+    if POSE_WORKER_ENABLED:
+        pose_worker = TelloPoseWorker(tello, settings)
+        pose_worker.start()
+        print("pose backend loading")
 
     execute_flight_plan(
         tello,
@@ -360,17 +441,14 @@ def main():
         waypoint_corrector=waypoint_corrector,
         pose_max_age_sec=POSE_MAX_AGE_SEC,
         takeoff_acknowledged=True,
+        landing_controller=landing_controller,
+        pre_landing_step_name=PRE_LANDING_VIDEO_STEP_NAME,
     )
 
     fly_time = time.time()
-    if pose_worker is not None:
-        pose_worker.stop()
-        pose_worker = None
-        landing_controller.setup_video(show_video=True)
-        while not tello.can_read_frame():
-            time.sleep(0.1)
     print(f" 비행 시간: {fly_time - start_time:.2f}초")
 
+    ensure_landing_video(tello, landing_controller)
     landing_controller.run()
 
     land_time = time.time()

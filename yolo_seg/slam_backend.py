@@ -179,11 +179,8 @@ class OrbSlam3PythonBackend(SlamBackend):
 			self._frames_tracked += 1
 			self._last_shape = (int(width), int(height))
 			state = str(record.get("tracking_state", record.get("state", "UNKNOWN"))).upper()
-			self._last_pose = (
-				parse_slam_pose(record, scale_to_cm=self.scale_to_cm, source="orbslam3_py")
-				if state in GOOD_SLAM_STATES
-				else None
-			)
+			if state in GOOD_SLAM_STATES:
+				self._last_pose = parse_slam_pose(record, scale_to_cm=self.scale_to_cm, source="orbslam3_py")
 			self._last_error = None
 		except Exception as exc:
 			self._last_error = str(exc)
@@ -200,11 +197,13 @@ class OrbSlam3PythonBackend(SlamBackend):
 		if self._last_shape is not None:
 			width, height = self._last_shape
 			frame_text = f"{frame_text}, {width}x{height}"
-		if self._last_pose is not None:
-			frame_text = f"{frame_text}, {self._last_pose.tracking_state}"
-		elif self._last_record is not None:
+		if self._last_record is not None:
 			state = str(self._last_record.get("tracking_state", self._last_record.get("state", "UNKNOWN")))
 			frame_text = f"{frame_text}, {state}"
+			if self._last_pose is not None and state.upper() not in GOOD_SLAM_STATES:
+				frame_text = f"{frame_text}, holding last pose"
+		elif self._last_pose is not None:
+			frame_text = f"{frame_text}, {self._last_pose.tracking_state}"
 		return frame_text
 
 	def close(self) -> None:
