@@ -1,8 +1,8 @@
 # Training
-epochs: 600 # train epochs
+epochs: 300 # train epochs
 time: null # time limit, null uses epochs
-patience: 100 # early stopping patience
-batch: 64 # batch size
+patience: 50 # early stopping patience
+batch: 32 # batch size
 imgsz: 480 # input image size
 cache: ram # dataset cache mode
 device: '0' # train device
@@ -39,7 +39,7 @@ plots: true # save plots
 augment: false # validation augmentation
 agnostic_nms: false # class-agnostic NMS
 classes: null # class filter
-retina_masks: false # high-resolution masks
+retina_masks: true # high-resolution masks
 show_labels: true # draw labels on plots
 show_conf: true # draw confidence on plots
 show_boxes: true # draw boxes on plots
@@ -47,12 +47,12 @@ line_width: null # plot line width
 
 # Optimization / Loss
 overlap_mask: true # allow overlapping masks
-mask_ratio: 4 # mask downsample ratio
-dropout: 0.02 # dropout rate
-lr0: 0.005 # initial learning rate
+mask_ratio: 2 # mask downsample ratio
+dropout: 0.03 # dropout rate
+lr0: 0.003 # initial learning rate
 lrf: 0.01 # final LR factor
 momentum: 0.937 # momentum
-weight_decay: 0.0007 # weight decay
+weight_decay: 0.001 # weight decay
 warmup_epochs: 3.0 # warmup epochs
 warmup_momentum: 0.8 # warmup momentum
 warmup_bias_lr: 0.1 # warmup bias LR
