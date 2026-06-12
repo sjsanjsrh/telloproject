@@ -18,7 +18,7 @@ pose_worker = None
 FLIGHT_PLAN_PATH = "flight_path.yaml"
 
 POSE_WORKER_ENABLED = True
-POSE_MODEL_PATH = "yolo_seg/res/runs/segment/train-18/weights/best.pt"
+POSE_MODEL_PATH = "yolo_seg/res/runs/segment/train-26/weights/best.pt"
 CAMERA_PARAMS_PATH = "camera_calibration/camera_params.yaml"
 CAMERA_PROFILE = "forward_480p"
 CAMERA_NAME = "forward"
@@ -50,8 +50,8 @@ ORBSLAM3_VOCAB = "third_party/orbslam3_windows/ORB_SLAM3/Vocabulary/ORBvoc.txt"
 ORBSLAM3_SETTINGS = "yolo_seg/orbslam3_tello_forward_480p.yaml"
 ORBSLAM3_PY_MODULE = "third_party/orbslam3_py/orbslam3_py.cp310-win_amd64.pyd"
 
-WAYPOINT_CORRECTION_ENABLED = True
-APPLY_WAYPOINT_CORRECTION = True
+WAYPOINT_CORRECTION_ENABLED = False
+APPLY_WAYPOINT_CORRECTION = False
 CORRECTION_GAIN = 0.4
 MAX_CORRECTION_CM = 25.0
 MIN_CORRECTION_CONFIDENCE = 0.45
