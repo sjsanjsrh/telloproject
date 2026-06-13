@@ -46,7 +46,7 @@ from yolo_seg.slam_backend import SlamPose, create_slam_backend
 from yolo_seg.world_pose import CameraWorldPose, TELLO_TO_OPENCV, estimate_camera_world_pose, yaw_rotation_matrix_z
 
 
-DEFAULT_MODEL = "yolo_seg/res/runs/segment/train/weights/best.pt"
+DEFAULT_MODEL = "yolo_seg/res/runs/segment/train-26/weights/best.pt"
 DEFAULT_CAMERA_PARAMS = Path("camera_calibration") / "camera_params.yaml"
 DEFAULT_SCENE_MAP = Path("yolo_seg") / "obstacles.yaml"
 DEFAULT_FLIGHT_PLAN = Path("flight_path.yaml")
